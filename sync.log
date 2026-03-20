@@ -1,0 +1,61 @@
+﻿bun : 
+<anonymous_script>:23
+In Zeile:1 Zeichen:1
++ bun run svelte-kit 
+sync 2>&1 | Out-File 
+-Encoding utf8 sync.log
++ ~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (<anonymous_sc   
+ ript>:23:String) [    
+], RemoteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+)
+^
+
+SyntaxError: 
+Unexpected token ')'
+    at eval 
+(<anonymous>)
+    at 
+load_user_tsconfig (fil
+e:///C:/Users/christoph
+er.ziesch/repos/Troiber
+/Projecte/ampelv1/node_
+modules/@sveltejs/kit/s
+rc/core/sync/write_tsco
+nfig.js:144:21)
+    at write_tsconfig (
+file:///C:/Users/christ
+opher.ziesch/repos/Troi
+ber/Projecte/ampelv1/no
+de_modules/@sveltejs/ki
+t/src/core/sync/write_t
+sconfig.js:44:22)
+    at init (file:///C:
+/Users/christopher.zies
+ch/repos/Troiber/Projec
+te/ampelv1/node_modules
+/@sveltejs/kit/src/core
+/sync/sync.js:21:2)
+    at 
+Module.all_types (file:
+///C:/Users/christopher
+.ziesch/repos/Troiber/P
+rojecte/ampelv1/node_mo
+dules/@sveltejs/kit/src
+/core/sync/sync.js:84:2
+)
+    at file:///C:/Users
+/christopher.ziesch/rep
+os/Troiber/Projecte/amp
+elv1/node_modules/@svel
+tejs/kit/src/cli.js:87:
+8
+
+Node.js v24.14.0

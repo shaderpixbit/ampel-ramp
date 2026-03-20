@@ -1,0 +1,215 @@
+<script lang="ts">
+  import { onMount, onDestroy } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+
+  type RampStatus = 'free' | 'pending' | 'closed';
+
+  interface Ramp {
+    id: number;
+    name: string;
+    status: RampStatus;
+    last_updated_by: string;
+    last_updated_at: string | null;
+  }
+
+  let ramps = $state<Ramp[]>([]);
+  let currentUser = $state("Unknown User");
+  let syncTimeout: number;
+  let isUpdating = $state(false); // To block multiple clicks during file IO write
+  let isConnected = $state(true); // Always true since we read directly from filesystem now
+  let isFetching = false;
+
+  onMount(async () => {
+    // Fetch user
+    try {
+      currentUser = await invoke("get_current_user");
+    } catch (e) {
+      console.error("Failed to get current user:", e);
+    }
+
+    // Load initial ramp state
+    await fetchRamps();
+
+    // Start network drive file-polling without overlap
+    syncTimeout = window.setTimeout(startPolling, 1500);
+  });
+
+  onDestroy(() => {
+    if (syncTimeout) clearTimeout(syncTimeout);
+  });
+
+  async function startPolling() {
+    if (!isUpdating && !isFetching) {
+      isFetching = true;
+      try {
+        const dbRamps: Ramp[] = await invoke("get_ramps");
+        
+        // Deep compare to prevent UI loop/flashing and CSS animation resets
+        if (JSON.stringify(ramps) !== JSON.stringify(dbRamps)) {
+          ramps = dbRamps;
+        }
+        
+        isConnected = true;
+      } catch (e) {
+        console.error("Failed to fetch state from network drive:", e);
+        isConnected = false; // Indicator for dropped network connection
+      } finally {
+        isFetching = false;
+      }
+    }
+    
+    // Recursively set timeout to avoid overlapping network calls
+    syncTimeout = window.setTimeout(startPolling, 1500);
+  }
+
+  async function fetchRamps() {
+    try {
+      const dbRamps: Ramp[] = await invoke("get_ramps");
+      ramps = dbRamps;
+      isConnected = true;
+    } catch (e) {
+      console.error("Failed to fetch state from network drive:", e);
+      isConnected = false;
+    }
+  }
+
+  async function cycleStatus(ramp: Ramp) {
+    if (isUpdating) return;
+    
+    const nextStatus: Record<RampStatus, RampStatus> = {
+      'free': 'pending',   // green -> yellow
+      'pending': 'closed', // yellow -> red
+      'closed': 'free'     // red -> green
+    };
+    
+    const newStatus = nextStatus[ramp.status];
+    const now = new Date().toISOString();
+
+    const updatedRamp: Ramp = {
+      ...ramp,
+      status: newStatus,
+      last_updated_by: currentUser,
+      last_updated_at: now
+    };
+
+    // Optimistically update the UI locally immediately
+    const index = ramps.findIndex(r => r.id === ramp.id);
+    if (index !== -1) {
+      ramps[index] = updatedRamp;
+    }
+
+    // Write mutation straight to disk
+    isUpdating = true;
+    try {
+      const updatedRamps: Ramp[] = await invoke("update_ramp", { updatedRamp });
+      ramps = updatedRamps; // Apply the synced version ensuring consistency
+    } catch (e) {
+      console.error("Failed to update ramp:", e);
+    } finally {
+      isUpdating = false;
+    }
+  }
+
+  function getStatusColor(status: RampStatus) {
+    switch (status) {
+      case 'free': return 'bg-emerald-500 hover:bg-emerald-400 shadow-[0_0_20px_rgba(16,185,129,0.5)] border-emerald-400 text-emerald-950';
+      case 'pending': return 'bg-amber-400 hover:bg-amber-300 shadow-[0_0_20px_rgba(251,191,36,0.5)] border-amber-300 text-amber-950';
+      case 'closed': return 'bg-rose-500 hover:bg-rose-400 shadow-[0_0_20px_rgba(225,29,72,0.5)] border-rose-400 text-rose-950';
+      default: return 'bg-neutral-800 border-neutral-700 text-neutral-500';
+    }
+  }
+
+  function formatDateTime(isoString: string | null) {
+    if (!isoString) return { date: '', time: '' };
+    const d = new Date(isoString);
+    return {
+      date: d.toLocaleDateString([], { day: '2-digit', month: '2-digit', year: 'numeric' }),
+      time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+  }
+</script>
+
+<main class="min-h-screen bg-[#0f0f0f] text-white p-2 md:p-6 font-sans overflow-hidden">
+  <div class="w-full max-w-[100vw] mx-auto flex flex-col h-full">
+    <header class="flex justify-between items-center mb-6 md:mb-12 pb-4 border-b border-white/10 px-2 lg:px-8">
+      <div>
+        <div class="flex items-center gap-3">
+          <h1 class="text-3xl md:text-5xl font-extrabold tracking-tight bg-linear-to-r from-white to-white/60 bg-clip-text text-transparent">Ramp Dashboard</h1>
+          <!-- Connection Status Indicator -->
+          <div class="flex flex-col items-center ml-2 border border-white/10 px-3 py-1 bg-white/5 rounded-full" title={isConnected ? 'Connected to Network Drive' : 'Disconnected from Network'}>
+            <div class="flex items-center gap-1.5">
+              <div class="w-2.5 h-2.5 rounded-full {isConnected ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)]' : 'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]'} animate-pulse"></div>
+              <span class="text-[0.6rem] font-bold text-neutral-300 uppercase leading-none tracking-wider hidden sm:block">{isConnected ? 'Drive Sync' : 'Lost Sync'}</span>
+            </div>
+          </div>
+        </div>
+        <p class="text-neutral-400 mt-2 font-medium">Network Drive Flashlight System</p>
+      </div>
+      
+      <div class="flex items-center gap-3 bg-white/5 backdrop-blur-md px-4 py-2 md:px-6 md:py-3 rounded-2xl border border-white/10 shadow-xl">
+        <div class="w-10 h-10 rounded-full bg-linear-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-lg font-bold shadow-inner">
+          {currentUser.charAt(0).toUpperCase()}
+        </div>
+        <div class="hidden sm:block">
+          <p class="text-sm font-semibold tracking-wide text-white/90">{currentUser}</p>
+          <p class="text-[0.65rem] text-indigo-300 mt-0.5 font-medium uppercase tracking-wider">Logged In</p>
+        </div>
+      </div>
+    </header>
+
+    {#if ramps.length === 0}
+      <div class="flex flex-col items-center justify-center h-64 text-neutral-500">
+        <div class="w-12 h-12 border-4 border-neutral-700 border-t-emerald-500 rounded-full animate-spin mb-4"></div>
+        <p class="text-lg font-medium">Connecting...</p>
+      </div>
+    {:else}
+      <!-- Exact 13 column responsive grid spanning the whole width so nothing ever cuts off -->
+      <div class="grid grid-cols-13 gap-1 sm:gap-2 w-full px-1 lg:px-4 pb-4">
+        {#each ramps as ramp (ramp.id)}
+          <button 
+            class="relative flex flex-col items-center justify-center p-1 sm:p-2 lg:p-3 rounded-lg md:rounded-xl border-2 
+                   transition-all text-center duration-300 transform hover:-translate-y-1 hover:scale-105 active:translate-y-1 active:scale-95 active:shadow-none
+                   {getStatusColor(ramp.status)} overflow-hidden group w-full min-h-[100px] md:min-h-[140px] lg:min-h-[180px]"
+            onclick={() => cycleStatus(ramp)}
+            aria-label="Change status of {ramp.name}"
+            disabled={!isConnected || isUpdating}
+          >
+            <!-- Glossy reflection effect overlay -->
+            <div class="absolute inset-x-0 top-0 h-[45%] bg-linear-to-b from-white/30 to-transparent pointer-events-none"></div>
+
+            <!-- Glass reflection line -->
+            <div class="absolute inset-0 w-full h-full bg-linear-to-tr from-white/0 via-white/20 to-white/0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none transform -skew-x-12 -translate-x-full group-hover:translate-x-full"></div>
+
+            <span class="text-lg sm:text-xl md:text-2xl lg:text-3xl font-black tracking-tight drop-shadow-sm mb-1">{ramp.id}</span>
+            
+            <div class="bg-black/15 rounded-md sm:rounded-lg px-0.5 py-1 w-full mt-auto backdrop-blur-md border border-white/20 shadow-inner overflow-hidden">
+              {#if ramp.last_updated_at}
+                {@const dt = formatDateTime(ramp.last_updated_at)}
+                <div class="flex flex-col justify-center items-center w-full text-[0.45rem] sm:text-[0.55rem] font-bold text-black/70">
+                  <span class="truncate max-w-[95%] font-extrabold text-[0.45rem] sm:text-[0.55rem] text-black/90 mb-0.5">{ramp.last_updated_by}</span>
+                  <div class="flex w-full items-center justify-center bg-black/10 py-0.5 rounded leading-none">
+                    <span class="text-[0.40rem] sm:text-[0.50rem] md:text-xs opacity-90 truncate">{dt.time}</span>
+                  </div>
+                </div>
+              {:else}
+                <div class="flex flex-col justify-center items-center w-full text-[0.45rem] sm:text-[0.55rem] font-bold text-black/50">
+                  <span class="truncate max-w-[95%] font-extrabold text-[0.45rem] sm:text-[0.55rem] opacity-90">Unused</span>
+                </div>
+              {/if}
+            </div>
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </div>
+</main>
+
+<style>
+  .hidden-scrollbar {
+    -ms-overflow-style: none;  /* IE and Edge */
+    scrollbar-width: none;  /* Firefox */
+  }
+  .hidden-scrollbar::-webkit-scrollbar {
+    display: none; /* Chrome, Safari and Opera */
+  }
+</style>

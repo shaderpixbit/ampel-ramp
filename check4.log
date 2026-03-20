@@ -1,0 +1,19 @@
+﻿Loading svelte-check in workspace: c:\Users\christopher.ziesch\repos\Troiber\Projecte\ampelv1
+Getting Svelte diagnostics...
+
+c:\Users\christopher.ziesch\repos\Troiber\Projecte\ampelv1\[32msrc\lib\components\ui\spinner\spinner.svelte[39m:17:12
+[31mError[39m: Expression produces a union type that is too complex to represent. (ts)
+[36m
+<Loader2Ico[35mn {role} color={color === null ? undefined : color} stroke={stroke === null ? undefined : stroke} aria-label={ariaLabel} class={cn("size-4 animate-spin", className)} {...restProps[36m} />[39m
+
+c:\Users\christopher.ziesch\repos\Troiber\Projecte\ampelv1\[32msrc\lib\components\ui\spinner\spinner.svelte[39m:17:12
+[31mError[39m: Type '{ className?: string | undefined | null; height?: number | string | undefined | null; id?: string | undefined | null; lang?: string | undefined | null; part?: string | undefined | null; ... 634 more ...; class: string; }' is not assignable to type 'IconProps'.
+  Types of property 'name' are incompatible.
+    Type 'string | null | undefined' is not assignable to type 'string | undefined'.
+      Type 'null' is not assignable to type 'string | undefined'. (ts)
+[36m
+<Loader2Ico[35m[36mn {role} color={color === null ? undefined : color} stroke={stroke === null ? undefined : stroke} aria-label={ariaLabel} class={cn("size-4 animate-spin", className)} {...restProps} />[39m
+
+====================================
+[31msvelte-check found 2 errors and 0 warnings in 1 file
+[39m

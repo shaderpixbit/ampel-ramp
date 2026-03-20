@@ -1,0 +1,104 @@
+﻿cargo :     Checking 
+ampelv1 v0.1.0 (C:\User
+s\christopher.ziesch\re
+pos\Troiber\Projecte\am
+pelv1\src-tauri)
+In Zeile:1 Zeichen:1
++ cargo check 2>&1 | 
+Out-File -Encoding 
+utf8 cargo_check.log
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (    Checking    
+ am...elv1\src-taur    
+i):String) [], Rem    
+oteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+error[E0432]: 
+unresolved import 
+`fs4::FileExt`
+ --> src\lib.rs:6:5
+  |
+6 | use fs4::FileExt;
+  |     ^^^^^^^^^^^^ 
+no `FileExt` in the 
+root
+  |
+help: consider 
+importing one of these 
+traits instead
+  |
+6 - use fs4::FileExt;
+6 + use std::os::window
+s::prelude::FileExt;
+  |
+6 | use 
+fs4::fs_std::FileExt;
+  |          ++++++++
+
+error[E0599]: no 
+method named 
+`lock_exclusive` found 
+for struct `File` in 
+the current scope
+  --> src\lib.rs:91:10
+   |
+91 |     file.lock_excl
+usive().map_err(|e| 
+e.to_string())?;
+   |          
+^^^^^^^^^^^^^^
+   |
+  ::: C:\Users\christop
+her.ziesch\.cargo\regis
+try\src\index.crates.io
+-1949cf8c6b5b557f\fs4-0
+.13.1\src\file_ext\sync
+_impl\std_impl.rs:7:1
+   |
+ 7 | file_ext!(File, 
+"std::fs::File");
+   | ------------------
+-------------- the 
+method is available 
+for `File` here
+   |
+   = help: items from 
+traits can only be 
+used if the trait is 
+in scope
+help: trait `FileExt` 
+which provides 
+`lock_exclusive` is 
+implemented but not in 
+scope; perhaps you 
+want to import it
+   |
+ 1 + use 
+fs4::fs_std::FileExt;
+   |
+help: there is a 
+method 
+`try_lock_exclusive` 
+with a similar name
+   |
+91 |     file.try_lock_
+exclusive().map_err(|e|
+ e.to_string())?;
+   |          ++++
+
+Some errors have 
+detailed explanations: 
+E0432, E0599.
+For more information 
+about an error, try 
+`rustc --explain 
+E0432`.
+error: could not 
+compile `ampelv1` 
+(lib) due to 2 
+previous errors
