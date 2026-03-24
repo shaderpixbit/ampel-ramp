@@ -19,7 +19,7 @@
           gdk-pixbuf
           glib
           dbus
-          openssl_3
+          openssl
           librsvg
           libsoup_3
         ];
@@ -29,7 +29,7 @@
           wget
           pkg-config
           dbus
-          openssl_3
+          openssl
           librsvg
           webkitgtk_4_1
           glib
