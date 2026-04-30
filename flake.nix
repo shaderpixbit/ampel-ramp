@@ -39,7 +39,7 @@
           rustc
           cargo
           nodejs_20 # Svelte 5 works great with Node 20+
-          nodePackages.pnpm # or substitute with pkgs.yarn / pkgs.bun
+          bun
         ];
       in
       {

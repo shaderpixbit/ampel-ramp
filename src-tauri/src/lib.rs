@@ -1,10 +1,12 @@
 use chrono::Local;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use tauri::command;
+
+const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Ramp {
@@ -17,7 +19,9 @@ struct Ramp {
 
 fn get_db_path() -> PathBuf {
     // Save state file right next to the executable on the network drive
-    let mut path = std::env::current_exe().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let mut path = std::env::current_exe()
+        .or_else(|_| std::env::current_dir())
+        .expect("Cannot determine executable or working directory path");
     path.pop(); // Remove executable name
     path.push("ramps_state.json");
     path
@@ -39,6 +43,63 @@ fn initialize_state() -> Vec<Ramp> {
     ramps
 }
 
+/// Opens the state file and acquires an exclusive lock.
+/// Logs a warning if locking fails (e.g. unsupported on some SMB mounts) but continues.
+fn open_state_file(path: &PathBuf) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| format!("Open error: {}", e))?;
+
+    if let Err(e) = file.lock_exclusive() {
+        eprintln!("Warning: could not acquire exclusive lock ({e}); proceeding without lock");
+    }
+
+    Ok(file)
+}
+
+/// Reads and parses the ramp state from an open file.
+/// Returns (ramps, dirty) where dirty=true means the state was initialized/migrated
+/// and must be written back to disk.
+fn read_state(file: &mut File) -> Result<(Vec<Ramp>, bool), String> {
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    let (ramps, dirty) = if contents.trim().is_empty() {
+        (initialize_state(), true)
+    } else {
+        match serde_json::from_str::<Vec<Ramp>>(&contents) {
+            Ok(r) => (r, false),
+            Err(e) => {
+                eprintln!("Warning: corrupted JSON ({e}), reinitializing state");
+                (initialize_state(), true)
+            }
+        }
+    };
+
+    // Auto-migrate to current ramp layout (42 down to 30, 13 ramps)
+    if ramps.len() != 13 || ramps.first().map(|r| r.id) != Some(42) {
+        eprintln!("Migrating ramp state to current layout");
+        return Ok((initialize_state(), true));
+    }
+
+    Ok((ramps, dirty))
+}
+
+/// Serializes ramps and writes them to the beginning of the file, truncating any leftover bytes.
+fn write_state(file: &mut File, ramps: &[Ramp]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(ramps).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Seek error: {}", e))?;
+    file.write_all(json.as_bytes())
+        .map_err(|e| format!("Write error: {}", e))?;
+    file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[command]
 fn get_current_user() -> String {
     std::env::var("USERNAME")
@@ -49,45 +110,11 @@ fn get_current_user() -> String {
 #[command]
 fn get_ramps() -> Result<Vec<Ramp>, String> {
     let path = get_db_path();
+    let mut file = open_state_file(&path)?;
+    let (ramps, dirty) = read_state(&mut file)?;
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| format!("Open error: {}", e))?;
-
-    // Lock exclusively (ignore error if unsupported on this specific SMB/Network drive)
-    // We cannot use lock_shared() here because writing the initial empty file on Windows throws an error!
-    let _ = file.lock_exclusive();
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Read error: {}", e))?;
-
-    let mut ramps = if contents.trim().is_empty() {
-        let initial = initialize_state();
-        let json = serde_json::to_string_pretty(&initial).map_err(|e| e.to_string())?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("Seek error: {}", e))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| format!("Write error: {}", e))?;
-        file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
-        initial
-    } else {
-        // Fallback to initial if json is corrupted by sudden power loss
-        serde_json::from_str(&contents).unwrap_or_else(|_| initialize_state())
-    };
-
-    // Auto-migrate the local database to the new mapping (42 down to 30)
-    if ramps.len() != 13 || ramps.first().map(|r| r.id) != Some(42) {
-        ramps = initialize_state();
-        let json = serde_json::to_string_pretty(&ramps).map_err(|e| e.to_string())?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("Seek error: {}", e))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| format!("Write error: {}", e))?;
-        file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
+    if dirty {
+        write_state(&mut file, &ramps)?;
     }
 
     let _ = file.unlock();
@@ -96,45 +123,22 @@ fn get_ramps() -> Result<Vec<Ramp>, String> {
 
 #[command]
 fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
-    let path = get_db_path();
-
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| format!("Open error: {}", e))?;
-
-    // Lock exclusively for writing to prevent race conditions on network drives
-    let _ = file.lock_exclusive();
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Read error: {}", e))?;
-
-    let mut ramps: Vec<Ramp> = if contents.trim().is_empty() {
-        initialize_state()
-    } else {
-        serde_json::from_str(&contents).unwrap_or_else(|_| initialize_state())
-    };
-
-    // Auto-migrate here as well just in case
-    if ramps.len() != 13 || ramps.first().map(|r| r.id) != Some(42) {
-        ramps = initialize_state();
+    if !VALID_STATUSES.contains(&updated_ramp.status.as_str()) {
+        return Err(format!(
+            "Invalid status '{}': must be one of {:?}",
+            updated_ramp.status, VALID_STATUSES
+        ));
     }
 
-    // Apply update to the targeted ramp
+    let path = get_db_path();
+    let mut file = open_state_file(&path)?;
+    let (mut ramps, _) = read_state(&mut file)?;
+
     if let Some(r) = ramps.iter_mut().find(|r| r.id == updated_ramp.id) {
         *r = updated_ramp;
     }
 
-    let json = serde_json::to_string_pretty(&ramps).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("Seek error: {}", e))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| format!("Write error: {}", e))?;
-    file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
-
+    write_state(&mut file, &ramps)?;
     let _ = file.unlock();
 
     Ok(ramps)

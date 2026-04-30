@@ -16,18 +16,24 @@
   let currentUser = $state("Unknown User");
   let syncTimeout: number;
   let isUpdating = $state(false); // To block multiple clicks during file IO write
-  let isConnected = $state(true); // Always true since we read directly from filesystem now
+  let isConnected = $state(true);
   let isFetching = false;
+  let syncError = $state<string | null>(null);
+  let errorTimeout: number;
+
+  function showError(message: string) {
+    syncError = message;
+    clearTimeout(errorTimeout);
+    errorTimeout = window.setTimeout(() => { syncError = null; }, 4000);
+  }
 
   onMount(async () => {
-    // Fetch user
     try {
       currentUser = await invoke("get_current_user");
     } catch (e) {
       console.error("Failed to get current user:", e);
     }
 
-    // Load initial ramp state
     await fetchRamps();
 
     // Start network drive file-polling without overlap
@@ -35,7 +41,8 @@
   });
 
   onDestroy(() => {
-    if (syncTimeout) clearTimeout(syncTimeout);
+    clearTimeout(syncTimeout);
+    clearTimeout(errorTimeout);
   });
 
   async function startPolling() {
@@ -43,21 +50,21 @@
       isFetching = true;
       try {
         const dbRamps: Ramp[] = await invoke("get_ramps");
-        
+
         // Deep compare to prevent UI loop/flashing and CSS animation resets
         if (JSON.stringify(ramps) !== JSON.stringify(dbRamps)) {
           ramps = dbRamps;
         }
-        
+
         isConnected = true;
       } catch (e) {
         console.error("Failed to fetch state from network drive:", e);
-        isConnected = false; // Indicator for dropped network connection
+        isConnected = false;
       } finally {
         isFetching = false;
       }
     }
-    
+
     // Recursively set timeout to avoid overlapping network calls
     syncTimeout = window.setTimeout(startPolling, 1500);
   }
@@ -70,18 +77,19 @@
     } catch (e) {
       console.error("Failed to fetch state from network drive:", e);
       isConnected = false;
+      showError("Could not load ramp state from network drive.");
     }
   }
 
   async function cycleStatus(ramp: Ramp) {
     if (isUpdating) return;
-    
+
     const nextStatus: Record<RampStatus, RampStatus> = {
       'free': 'pending',   // green -> yellow
       'pending': 'closed', // yellow -> red
       'closed': 'free'     // red -> green
     };
-    
+
     const newStatus = nextStatus[ramp.status];
     const now = new Date().toISOString();
 
@@ -92,8 +100,11 @@
       last_updated_at: now
     };
 
-    // Optimistically update the UI locally immediately
+    // Save old state for rollback
     const index = ramps.findIndex(r => r.id === ramp.id);
+    const oldRamp = index !== -1 ? { ...ramps[index] } : null;
+
+    // Optimistically update the UI locally immediately
     if (index !== -1) {
       ramps[index] = updatedRamp;
     }
@@ -105,6 +116,11 @@
       ramps = updatedRamps; // Apply the synced version ensuring consistency
     } catch (e) {
       console.error("Failed to update ramp:", e);
+      // Roll back the optimistic update
+      if (index !== -1 && oldRamp) {
+        ramps[index] = oldRamp;
+      }
+      showError(`Failed to update Ramp ${ramp.id}. Please try again.`);
     } finally {
       isUpdating = false;
     }
@@ -130,6 +146,13 @@
 </script>
 
 <main class="min-h-screen bg-[#0f0f0f] text-white p-2 md:p-6 font-sans overflow-hidden">
+  <!-- Error notification -->
+  {#if syncError}
+    <div class="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-rose-900/90 border border-rose-500/50 text-rose-100 text-sm font-medium px-5 py-3 rounded-xl shadow-xl backdrop-blur-md transition-all">
+      {syncError}
+    </div>
+  {/if}
+
   <div class="w-full max-w-[100vw] mx-auto flex flex-col h-full">
     <header class="flex justify-between items-center mb-6 md:mb-12 pb-4 border-b border-white/10 px-2 lg:px-8">
       <div>
@@ -145,7 +168,7 @@
         </div>
         <p class="text-neutral-400 mt-2 font-medium">Network Drive Flashlight System</p>
       </div>
-      
+
       <div class="flex items-center gap-3 bg-white/5 backdrop-blur-md px-4 py-2 md:px-6 md:py-3 rounded-2xl border border-white/10 shadow-xl">
         <div class="w-10 h-10 rounded-full bg-linear-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-lg font-bold shadow-inner">
           {currentUser.charAt(0).toUpperCase()}
@@ -166,8 +189,8 @@
       <!-- Exact 13 column responsive grid spanning the whole width so nothing ever cuts off -->
       <div class="grid grid-cols-13 gap-1 sm:gap-2 w-full px-1 lg:px-4 pb-4">
         {#each ramps as ramp (ramp.id)}
-          <button 
-            class="relative flex flex-col items-center justify-center p-1 sm:p-2 lg:p-3 rounded-lg md:rounded-xl border-2 
+          <button
+            class="relative flex flex-col items-center justify-center p-1 sm:p-2 lg:p-3 rounded-lg md:rounded-xl border-2
                    transition-all text-center duration-300 transform hover:-translate-y-1 hover:scale-105 active:translate-y-1 active:scale-95 active:shadow-none
                    {getStatusColor(ramp.status)} overflow-hidden group w-full min-h-[100px] md:min-h-[140px] lg:min-h-[180px]"
             onclick={() => cycleStatus(ramp)}
@@ -181,7 +204,7 @@
             <div class="absolute inset-0 w-full h-full bg-linear-to-tr from-white/0 via-white/20 to-white/0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none transform -skew-x-12 -translate-x-full group-hover:translate-x-full"></div>
 
             <span class="text-lg sm:text-xl md:text-2xl lg:text-3xl font-black tracking-tight drop-shadow-sm mb-1">{ramp.id}</span>
-            
+
             <div class="bg-black/15 rounded-md sm:rounded-lg px-0.5 py-1 w-full mt-auto backdrop-blur-md border border-white/20 shadow-inner overflow-hidden">
               {#if ramp.last_updated_at}
                 {@const dt = formatDateTime(ramp.last_updated_at)}
