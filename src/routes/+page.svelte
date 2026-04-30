@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
 
   type RampStatus = 'free' | 'pending' | 'closed';
@@ -10,16 +10,31 @@
     status: RampStatus;
     last_updated_by: string;
     last_updated_at: string | null;
+    locked_until: number | null;
+  }
+
+  interface ChatMessage {
+    id: string;
+    user: string;
+    text: string;
+    timestamp: string;
   }
 
   let ramps = $state<Ramp[]>([]);
   let currentUser = $state("Unknown User");
   let syncTimeout: number;
-  let isUpdating = $state(false); // To block multiple clicks during file IO write
+  let isUpdating = $state(false);
   let isConnected = $state(true);
   let isFetching = false;
   let syncError = $state<string | null>(null);
   let errorTimeout: number;
+
+
+  // Chat state
+  let messages = $state<ChatMessage[]>([]);
+  let chatInput = $state('');
+  let isSendingMessage = $state(false);
+  let chatScrollEl: HTMLElement;
 
   function showError(message: string) {
     syncError = message;
@@ -36,7 +51,14 @@
 
     await fetchRamps();
 
-    // Start network drive file-polling without overlap
+    try {
+      messages = await invoke("get_messages");
+      await tick();
+      if (chatScrollEl) chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+    } catch (e) {
+      console.error("Failed to load messages:", e);
+    }
+
     syncTimeout = window.setTimeout(startPolling, 1500);
   });
 
@@ -49,11 +71,19 @@
     if (!isUpdating && !isFetching) {
       isFetching = true;
       try {
-        const dbRamps: Ramp[] = await invoke("get_ramps");
+        const [dbRamps, dbMessages]: [Ramp[], ChatMessage[]] = await Promise.all([
+          invoke("get_ramps"),
+          invoke("get_messages"),
+        ]);
 
-        // Deep compare to prevent UI loop/flashing and CSS animation resets
         if (JSON.stringify(ramps) !== JSON.stringify(dbRamps)) {
           ramps = dbRamps;
+        }
+
+        if (JSON.stringify(messages) !== JSON.stringify(dbMessages)) {
+          messages = dbMessages;
+          await tick();
+          if (chatScrollEl) chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
         }
 
         isConnected = true;
@@ -65,7 +95,6 @@
       }
     }
 
-    // Recursively set timeout to avoid overlapping network calls
     syncTimeout = window.setTimeout(startPolling, 1500);
   }
 
@@ -81,13 +110,17 @@
     }
   }
 
+  function isRampLocked(ramp: Ramp): boolean {
+    return !!ramp.locked_until && ramp.locked_until > Date.now();
+  }
+
   async function cycleStatus(ramp: Ramp) {
-    if (isUpdating) return;
+    if (isUpdating || isRampLocked(ramp)) return;
 
     const nextStatus: Record<RampStatus, RampStatus> = {
-      'free': 'pending',   // green -> yellow
-      'pending': 'closed', // yellow -> red
-      'closed': 'free'     // red -> green
+      'free': 'pending',
+      'pending': 'closed',
+      'closed': 'free'
     };
 
     const newStatus = nextStatus[ramp.status];
@@ -100,29 +133,44 @@
       last_updated_at: now
     };
 
-    // Save old state for rollback
     const index = ramps.findIndex(r => r.id === ramp.id);
     const oldRamp = index !== -1 ? { ...ramps[index] } : null;
 
-    // Optimistically update the UI locally immediately
     if (index !== -1) {
       ramps[index] = updatedRamp;
     }
 
-    // Write mutation straight to disk
     isUpdating = true;
     try {
       const updatedRamps: Ramp[] = await invoke("update_ramp", { updatedRamp });
-      ramps = updatedRamps; // Apply the synced version ensuring consistency
+      ramps = updatedRamps;
     } catch (e) {
       console.error("Failed to update ramp:", e);
-      // Roll back the optimistic update
       if (index !== -1 && oldRamp) {
         ramps[index] = oldRamp;
       }
       showError(`Failed to update Ramp ${ramp.id}. Please try again.`);
     } finally {
       isUpdating = false;
+    }
+  }
+
+  async function sendMessage() {
+    const text = chatInput.trim();
+    if (!text || isSendingMessage) return;
+
+    chatInput = '';
+    isSendingMessage = true;
+    try {
+      const updated: ChatMessage[] = await invoke("send_message", { user: currentUser, text });
+      messages = updated;
+      await tick();
+      if (chatScrollEl) chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+    } catch (e) {
+      console.error("Failed to send message:", e);
+      chatInput = text;
+    } finally {
+      isSendingMessage = false;
     }
   }
 
@@ -142,6 +190,11 @@
       date: d.toLocaleDateString([], { day: '2-digit', month: '2-digit', year: 'numeric' }),
       time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
+  }
+
+  function formatTime(isoString: string) {
+    const d = new Date(isoString);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 </script>
 
@@ -192,16 +245,22 @@
           <button
             class="relative flex flex-col items-center justify-center p-1 sm:p-2 lg:p-3 rounded-lg md:rounded-xl border-2
                    transition-all text-center duration-300 transform hover:-translate-y-1 hover:scale-105 active:translate-y-1 active:scale-95 active:shadow-none
-                   {getStatusColor(ramp.status)} overflow-hidden group w-full min-h-[100px] md:min-h-[140px] lg:min-h-[180px]"
+                   {getStatusColor(ramp.status)} overflow-hidden group w-full min-h-[100px] md:min-h-[140px] lg:min-h-[180px]
+                   {isRampLocked(ramp) ? 'opacity-70' : ''}"
             onclick={() => cycleStatus(ramp)}
             aria-label="Change status of {ramp.name}"
-            disabled={!isConnected || isUpdating}
+            disabled={!isConnected || isUpdating || isRampLocked(ramp)}
           >
             <!-- Glossy reflection effect overlay -->
             <div class="absolute inset-x-0 top-0 h-[45%] bg-linear-to-b from-white/30 to-transparent pointer-events-none"></div>
 
             <!-- Glass reflection line -->
             <div class="absolute inset-0 w-full h-full bg-linear-to-tr from-white/0 via-white/20 to-white/0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none transform -skew-x-12 -translate-x-full group-hover:translate-x-full"></div>
+
+            <!-- 3-second cooldown pulse ring -->
+            {#if isRampLocked(ramp)}
+              <div class="absolute inset-0 rounded-lg md:rounded-xl ring-2 ring-inset ring-white/50 animate-pulse pointer-events-none"></div>
+            {/if}
 
             <span class="text-lg sm:text-xl md:text-2xl lg:text-3xl font-black tracking-tight drop-shadow-sm mb-1">{ramp.id}</span>
 
@@ -224,15 +283,75 @@
         {/each}
       </div>
     {/if}
+
+    <!-- Chat Section -->
+    <div class="px-1 lg:px-4 pb-4 mt-2">
+      <div class="border-t border-white/10 pt-4 flex flex-col gap-3">
+        <h2 class="text-xs font-semibold text-neutral-500 uppercase tracking-widest px-1">Team Chat</h2>
+
+        <!-- Messages list -->
+        <div
+          bind:this={chatScrollEl}
+          class="bg-black/30 border border-white/10 rounded-xl p-3 h-[150px] overflow-y-auto flex flex-col gap-1.5 chat-scroll"
+        >
+          {#if messages.length === 0}
+            <p class="text-neutral-600 text-xs text-center m-auto">No messages yet</p>
+          {/if}
+          {#each messages as msg (msg.id)}
+            <div class="flex items-baseline gap-2 text-xs min-w-0">
+              <span class="font-bold text-indigo-400 shrink-0 max-w-[120px] truncate">{msg.user}</span>
+              <span class="text-neutral-200 flex-1 break-words min-w-0">{msg.text}</span>
+              <span class="text-neutral-600 text-[0.6rem] shrink-0">{formatTime(msg.timestamp)}</span>
+            </div>
+          {/each}
+        </div>
+
+        <!-- Input row -->
+        <form onsubmit={(e) => { e.preventDefault(); sendMessage(); }} class="flex gap-2">
+          <input
+            type="text"
+            bind:value={chatInput}
+            placeholder="Send a message to the team..."
+            disabled={!isConnected || isSendingMessage}
+            maxlength={300}
+            class="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-2 text-sm text-white placeholder-neutral-600
+                   focus:outline-none focus:border-indigo-500/50 focus:bg-white/8 disabled:opacity-50 transition-colors"
+          />
+          <button
+            type="submit"
+            disabled={!isConnected || isSendingMessage || !chatInput.trim()}
+            class="bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed
+                   text-white text-sm font-semibold px-5 py-2 rounded-xl transition-colors"
+          >
+            Send
+          </button>
+        </form>
+      </div>
+    </div>
   </div>
 </main>
 
 <style>
   .hidden-scrollbar {
-    -ms-overflow-style: none;  /* IE and Edge */
-    scrollbar-width: none;  /* Firefox */
+    -ms-overflow-style: none;
+    scrollbar-width: none;
   }
   .hidden-scrollbar::-webkit-scrollbar {
-    display: none; /* Chrome, Safari and Opera */
+    display: none;
+  }
+
+  .chat-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.15) transparent;
+  }
+  .chat-scroll::-webkit-scrollbar {
+    width: 4px;
+  }
+  .chat-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .chat-scroll::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.15);
+    border-radius: 2px;
   }
 </style>

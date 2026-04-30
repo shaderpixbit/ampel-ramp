@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use tauri::command;
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
+const MAX_CHAT_MESSAGES: usize = 200;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Ramp {
@@ -15,6 +16,17 @@ struct Ramp {
     status: String,
     last_updated_by: String,
     last_updated_at: Option<String>,
+    // Unix ms timestamp until which this ramp is locked for all clients
+    #[serde(default)]
+    locked_until: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ChatMessage {
+    id: String,
+    user: String,
+    text: String,
+    timestamp: String,
 }
 
 fn get_db_path() -> PathBuf {
@@ -24,6 +36,15 @@ fn get_db_path() -> PathBuf {
         .expect("Cannot determine executable or working directory path");
     path.pop(); // Remove executable name
     path.push("ramps_state.json");
+    path
+}
+
+fn get_chat_path() -> PathBuf {
+    let mut path = std::env::current_exe()
+        .or_else(|_| std::env::current_dir())
+        .expect("Cannot determine executable or working directory path");
+    path.pop();
+    path.push("chat_messages.json");
     path
 }
 
@@ -38,6 +59,7 @@ fn initialize_state() -> Vec<Ramp> {
             status: "free".to_string(),
             last_updated_by: "System".to_string(),
             last_updated_at: Some(now.clone()),
+            locked_until: None,
         });
     }
     ramps
@@ -111,7 +133,16 @@ fn get_current_user() -> String {
 fn get_ramps() -> Result<Vec<Ramp>, String> {
     let path = get_db_path();
     let mut file = open_state_file(&path)?;
-    let (ramps, dirty) = read_state(&mut file)?;
+    let (mut ramps, mut dirty) = read_state(&mut file)?;
+
+    // Clear any locks that have expired so all clients see the ramp become available
+    let now_ms = Local::now().timestamp_millis();
+    for ramp in ramps.iter_mut() {
+        if ramp.locked_until.map(|ms| ms <= now_ms).unwrap_or(false) {
+            ramp.locked_until = None;
+            dirty = true;
+        }
+    }
 
     if dirty {
         write_state(&mut file, &ramps)?;
@@ -134,14 +165,77 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
     let mut file = open_state_file(&path)?;
     let (mut ramps, _) = read_state(&mut file)?;
 
+    let locked_until = Local::now().timestamp_millis() + 3000;
     if let Some(r) = ramps.iter_mut().find(|r| r.id == updated_ramp.id) {
         *r = updated_ramp;
+        r.locked_until = Some(locked_until);
     }
 
     write_state(&mut file, &ramps)?;
     let _ = file.unlock();
 
     Ok(ramps)
+}
+
+#[command]
+fn get_messages() -> Result<Vec<ChatMessage>, String> {
+    let path = get_chat_path();
+    let mut file = open_state_file(&path)?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| format!("Read error: {}", e))?;
+    let _ = file.unlock();
+
+    let messages: Vec<ChatMessage> = if contents.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&contents).unwrap_or_default()
+    };
+
+    let start = messages.len().saturating_sub(50);
+    Ok(messages[start..].to_vec())
+}
+
+#[command]
+fn send_message(user: String, text: String) -> Result<Vec<ChatMessage>, String> {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Message cannot be empty".to_string());
+    }
+
+    let path = get_chat_path();
+    let mut file = open_state_file(&path)?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    let mut messages: Vec<ChatMessage> = if contents.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&contents).unwrap_or_default()
+    };
+
+    let id = Local::now().timestamp_millis().to_string();
+    let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    messages.push(ChatMessage { id, user, text: trimmed, timestamp });
+
+    if messages.len() > MAX_CHAT_MESSAGES {
+        let drain_to = messages.len() - MAX_CHAT_MESSAGES;
+        messages.drain(0..drain_to);
+    }
+
+    let json = serde_json::to_string_pretty(&messages).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Seek error: {}", e))?;
+    file.write_all(json.as_bytes())
+        .map_err(|e| format!("Write error: {}", e))?;
+    file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
+    let _ = file.unlock();
+
+    let start = messages.len().saturating_sub(50);
+    Ok(messages[start..].to_vec())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -151,7 +245,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_current_user,
             get_ramps,
-            update_ramp
+            update_ramp,
+            get_messages,
+            send_message
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
