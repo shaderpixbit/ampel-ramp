@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tauri::command;
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
-const MAX_CHAT_MESSAGES: usize = 200;
+const MAX_CHAT_MESSAGES: usize = 10;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Ramp {
@@ -165,7 +165,7 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
     let mut file = open_state_file(&path)?;
     let (mut ramps, _) = read_state(&mut file)?;
 
-    let locked_until = Local::now().timestamp_millis() + 3000;
+    let locked_until = Local::now().timestamp_millis() + 2000;
     if let Some(r) = ramps.iter_mut().find(|r| r.id == updated_ramp.id) {
         *r = updated_ramp;
         r.locked_until = Some(locked_until);
@@ -219,7 +219,12 @@ fn send_message(user: String, text: String) -> Result<Vec<ChatMessage>, String> 
 
     let id = Local::now().timestamp_millis().to_string();
     let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    messages.push(ChatMessage { id, user, text: trimmed, timestamp });
+    messages.push(ChatMessage {
+        id,
+        user,
+        text: trimmed,
+        timestamp,
+    });
 
     if messages.len() > MAX_CHAT_MESSAGES {
         let drain_to = messages.len() - MAX_CHAT_MESSAGES;
