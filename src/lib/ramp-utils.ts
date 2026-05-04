@@ -25,10 +25,19 @@ export function isRampLocked(ramp: Pick<Ramp, "locked_until">): boolean {
 
 export function getStatusColor(status: RampStatus): string {
   switch (status) {
-    case "free":    return "bg-emerald-500 hover:bg-emerald-400 shadow-[0_0_20px_rgba(16,185,129,0.5)] border-emerald-400 text-emerald-950";
-    case "pending": return "bg-amber-400 hover:bg-amber-300 shadow-[0_0_20px_rgba(251,191,36,0.5)] border-amber-300 text-amber-950";
-    case "closed":  return "bg-rose-500 hover:bg-rose-400 shadow-[0_0_20px_rgba(225,29,72,0.5)] border-rose-400 text-rose-950";
+    case "free":    return "bg-emerald-500 hover:bg-emerald-400 shadow-sm border-emerald-600 text-emerald-950";
+    case "pending": return "bg-amber-400 hover:bg-amber-300 shadow-sm border-amber-500 text-amber-950";
+    case "closed":  return "bg-rose-500 hover:bg-rose-400 shadow-sm border-rose-600 text-rose-950";
     default:        return "bg-neutral-800 border-neutral-700 text-neutral-500";
+  }
+}
+
+export function getStatusLabel(status: RampStatus): string {
+  switch (status) {
+    case "free":    return "Frei";
+    case "pending": return "Wartend";
+    case "closed":  return "Belegt";
+    default:        return "—";
   }
 }
 
