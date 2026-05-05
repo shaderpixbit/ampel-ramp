@@ -12,7 +12,16 @@
         type Ramp,
     } from "$lib/ramp-utils";
     import { Button } from "$lib/components/ui/button";
-    import { MoonIcon, SunIcon, SendIcon } from "@lucide/svelte";
+    import {
+        MoonIcon,
+        SunIcon,
+        SendIcon,
+        TruckIcon,
+        CheckIcon,
+        ClockIcon,
+        LockIcon,
+        LoaderCircleIcon,
+    } from "@lucide/svelte";
 
     interface ChatMessage {
         id: string;
@@ -268,31 +277,34 @@
             <div class="flex items-center justify-between shrink-0">
                 <div>
                     <h2 class="text-sm font-semibold uppercase tracking-wider">
-                        Ramps
+                        Rampen
                     </h2>
                     <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
-                        Klicken um Status zu ändern · 3 s Sperre nach Wechsel
+                        Klicken um Status zu ändern
                     </p>
                 </div>
-                <div class="flex items-center gap-2 text-xs font-medium">
+                <div class="flex items-center gap-2 text-sm font-semibold">
                     <span
-                        class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/20"
+                        class="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30"
                     >
-                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"
+                        <span
+                            class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]"
                         ></span>
                         {counts.free} Frei
                     </span>
                     <span
-                        class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                        class="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/30"
                     >
-                        <span class="w-1.5 h-1.5 rounded-full bg-amber-500"
+                        <span
+                            class="w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)]"
                         ></span>
                         {counts.pending} Wartend
                     </span>
                     <span
-                        class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-500/20"
+                        class="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-500/30"
                     >
-                        <span class="w-1.5 h-1.5 rounded-full bg-rose-500"
+                        <span
+                            class="w-2 h-2 rounded-full bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]"
                         ></span>
                         {counts.closed} Belegt
                     </span>
@@ -310,14 +322,43 @@
                     <p class="text-sm font-medium">Verbinde…</p>
                 </div>
             {:else}
-                <div class="flex-1 grid grid-cols-13 gap-1.5 min-h-0">
+                <div class="flex-1 grid grid-cols-13 gap-2 min-h-0">
                     {#each ramps as ramp (ramp.id)}
                         {@const locked = isRampLocked(ramp)}
                         {@const occupied = ramp.status !== "free"}
                         {@const docked = ramp.status === "closed"}
+                        {@const apronBg =
+                            ramp.status === "free"
+                                ? "bg-emerald-500"
+                                : ramp.status === "pending"
+                                  ? "bg-amber-400"
+                                  : "bg-rose-500"}
+                        {@const doorGradient =
+                            ramp.status === "free"
+                                ? "bg-gradient-to-b from-emerald-300 to-emerald-600"
+                                : ramp.status === "pending"
+                                  ? "bg-gradient-to-b from-amber-200 to-amber-500"
+                                  : "bg-gradient-to-b from-rose-300 to-rose-600"}
+                        {@const glow =
+                            ramp.status === "free"
+                                ? "shadow-emerald-500/40 hover:shadow-emerald-500/60"
+                                : ramp.status === "pending"
+                                  ? "shadow-amber-500/40 hover:shadow-amber-500/60"
+                                  : "shadow-rose-500/40 hover:shadow-rose-500/60"}
+                        {@const iconColor =
+                            ramp.status === "free"
+                                ? "text-emerald-600 dark:text-emerald-400"
+                                : ramp.status === "pending"
+                                  ? "text-amber-600 dark:text-amber-400"
+                                  : "text-rose-600 dark:text-rose-400"}
                         <button
-                            class="relative flex flex-col rounded-md overflow-hidden border border-zinc-300 dark:border-zinc-700 hover:border-zinc-500 dark:hover:border-zinc-500 transition-colors text-left disabled:cursor-not-allowed
-                                   {locked ? 'opacity-70' : ''}"
+                            class="relative flex flex-col rounded-xl overflow-hidden border-2 border-white/60 dark:border-zinc-600
+                                   shadow-lg {glow}
+                                   transition-all duration-200 ease-out text-left
+                                   hover:scale-[1.03] hover:-translate-y-0.5 hover:shadow-xl
+                                   active:scale-[0.97]
+                                   disabled:cursor-not-allowed
+                                   {locked ? 'opacity-95' : ''}"
                             onclick={() => cycleStatus(ramp)}
                             aria-label="Ramp {ramp.id}, status: {getStatusLabel(
                                 ramp.status,
@@ -326,94 +367,78 @@
                         >
                             {#if locked}
                                 <div
-                                    class="absolute inset-0 rounded-md ring-2 ring-inset ring-amber-400 animate-pulse pointer-events-none z-20"
-                                ></div>
+                                    class="absolute inset-0 z-30 bg-black/20 dark:bg-black/45 flex items-center justify-center pointer-events-none backdrop-blur-[1px]"
+                                >
+                                    <LoaderCircleIcon
+                                        class="w-6 h-6 text-white drop-shadow-md animate-spin"
+                                    />
+                                </div>
                             {/if}
 
-                            <!-- Building / dock wall with ramp number -->
+                            <!-- Building wall: number + status icon -->
                             <div
-                                class="bg-zinc-300 dark:bg-zinc-700 px-1 pt-1.5 pb-1.5 text-center"
+                                class="flex items-center justify-between px-1.5 pt-1.5 pb-1.5 bg-gradient-to-b from-zinc-200 to-zinc-300 dark:from-zinc-700 dark:to-zinc-800"
                             >
                                 <span
-                                    class="text-2xl font-bold text-zinc-800 dark:text-zinc-100 leading-none tracking-tight"
+                                    class="text-2xl font-extrabold text-zinc-800 dark:text-zinc-100 leading-none tracking-tight"
                                 >
                                     {ramp.id}
                                 </span>
+                                {#if ramp.status === "free"}
+                                    <CheckIcon
+                                        class="w-4 h-4 {iconColor} drop-shadow-sm shrink-0"
+                                    />
+                                {:else if ramp.status === "pending"}
+                                    <ClockIcon
+                                        class="w-4 h-4 {iconColor} drop-shadow-sm shrink-0"
+                                    />
+                                {:else}
+                                    <LockIcon
+                                        class="w-4 h-4 {iconColor} drop-shadow-sm shrink-0"
+                                    />
+                                {/if}
                             </div>
 
-                            <!-- Dock door (status colored bar) -->
+                            <!-- Dock door: thick LED-like bar -->
                             <div
-                                class="h-2.5 border-x-2 border-b
-                                       {ramp.status === 'free'
-                                    ? 'bg-emerald-500 border-emerald-700'
-                                    : ''}
-                                       {ramp.status === 'pending'
-                                    ? 'bg-amber-400 border-amber-600'
-                                    : ''}
-                                       {ramp.status === 'closed'
-                                    ? 'bg-rose-500 border-rose-700'
-                                    : ''}"
+                                class="h-4 {doorGradient} border-y border-zinc-700/30 shadow-inner"
                             ></div>
 
-                            <!-- Apron: parking area -->
+                            <!-- Apron: full status-colored bay -->
                             <div
-                                class="relative flex-1 bg-zinc-50 dark:bg-zinc-900 border-x-2 border-zinc-300 dark:border-zinc-700 overflow-hidden"
+                                class="relative flex-1 {apronBg} overflow-hidden shadow-inner"
                             >
                                 <!-- Center lane marking -->
                                 <div
-                                    class="absolute inset-y-2 left-1/2 -translate-x-1/2 w-px border-l border-dashed border-zinc-300 dark:border-zinc-700"
+                                    class="absolute inset-y-2 left-1/2 -translate-x-1/2 w-px border-l-2 border-dashed border-white/40"
                                 ></div>
 
                                 {#if occupied}
-                                    <!-- Truck (top-down): trailer + cab -->
                                     <div
                                         class="absolute left-1/2 -translate-x-1/2 w-[78%] h-[60%] flex flex-col items-stretch transition-all duration-500 ease-out
-                                               {docked ? 'top-0' : 'top-[30%]'}"
+                                               {docked
+                                            ? 'top-0'
+                                            : 'top-[30%] animate-pulse'}"
                                     >
                                         <!-- Trailer -->
-                                        {#if ramp.status === "closed"}
-                                            <div
-                                                class="flex-1 bg-rose-500 dark:bg-rose-500 border border-zinc-500 dark:border-zinc-600 rounded-sm shadow-sm flex items-center justify-center"
-                                            >
-                                                <span
-                                                    class="text-[0.5rem] font-bold text-zinc-400 dark:text-zinc-600 tracking-wider"
-                                                >
-                                                    {ramp.name}
-                                                </span>
-                                            </div>
-                                        {:else if ramp.status === "pending"}
-                                            <div
-                                                class="flex-1 bg-amber-400 dark:bg-amber-400 border border-zinc-500 dark:border-zinc-600 rounded-sm shadow-sm flex items-center justify-center"
-                                            >
-                                                <span
-                                                    class="text-[0.5rem] font-bold text-zinc-400 dark:text-zinc-600 tracking-wider"
-                                                >
-                                                    {ramp.name}
-                                                </span>
-                                            </div>
-                                        {:else}
-                                            <div
-                                                class="flex-1 bg-white dark:bg-zinc-200 border border-zinc-500 dark:border-zinc-600 rounded-sm shadow-sm flex items-center justify-center"
-                                            >
-                                                <span
-                                                    class="text-[0.5rem] font-bold text-zinc-400 dark:text-zinc-600 tracking-wider"
-                                                ></span>
-                                            </div>
-                                        {/if}
-
+                                        <div
+                                            class="flex-1 bg-white border-2 border-zinc-800 rounded-md shadow-md flex items-center justify-center"
+                                        >
+                                            <TruckIcon
+                                                class="w-4 h-4 text-zinc-500 rotate-90"
+                                            />
+                                        </div>
                                         <!-- Cab -->
                                         <div
-                                            class="w-[80%] mx-auto bg-zinc-700 dark:bg-zinc-500 border border-zinc-800 dark:border-zinc-600 rounded-sm h-6 mt-px"
+                                            class="w-[80%] mx-auto bg-zinc-800 dark:bg-zinc-900 border-2 border-zinc-900 rounded-md h-5 mt-0.5 shadow-sm"
                                         ></div>
                                     </div>
-                                    <!-- ✅ FIXED: Closes Truck container -->
                                 {/if}
                             </div>
-                            <!-- ✅ FIXED: Closes Apron container -->
 
-                            <!-- Info strip: last user/time -->
+                            <!-- Info strip -->
                             <div
-                                class="bg-zinc-200 dark:bg-zinc-800 border-t border-zinc-300 dark:border-zinc-700 px-1 py-1 text-center"
+                                class="bg-zinc-100/95 dark:bg-zinc-800/95 backdrop-blur-sm border-t border-zinc-300 dark:border-zinc-700 px-1 py-1 text-center"
                             >
                                 {#if ramp.last_updated_at}
                                     {@const dt = formatDateTime(
