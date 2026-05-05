@@ -454,6 +454,11 @@
                                     >
                                         {dt.time}
                                     </p>
+                                    <p
+                                        class="text-[0.5rem] text-zinc-500 dark:text-zinc-400 truncate"
+                                    >
+                                        {dt.date}
+                                    </p>
                                 {:else}
                                     <p
                                         class="text-[0.55rem] text-zinc-400 dark:text-zinc-500 italic"
@@ -477,7 +482,7 @@
             >
                 <div>
                     <h2 class="text-sm font-semibold uppercase tracking-wider">
-                        Team Chat
+                        Troiber Team Chat
                     </h2>
                     <p
                         class="text-[0.65rem] text-zinc-500 dark:text-zinc-400 mt-0.5"
