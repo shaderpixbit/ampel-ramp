@@ -146,17 +146,3 @@ Sie müssen sich nicht extra anmelden.
 ![Benutzer-Anzeige](images/09-user-badge.png)
 
 ---
-
-## Aufnahme-Checkliste für Screenshots
-
-Speichern Sie alle Bilder unter `docs/images/`:
-
-- [ ] `01-overview.png` — Gesamtansicht des Fensters bei verschiedenen Rampen-Status.
-- [ ] `02-counts.png` — Nahaufnahme der drei Status-Chips (Frei / Wartend / Belegt) oben in der Rampen-Übersicht.
-- [ ] `03-status-cycle.png` — Drei Rampen nebeneinander in Frei / Wartend / Belegt.
-- [ ] `04-truck-states.png` — Drei Rampen mit dem LKW in den Zuständen leer / wartend / belegt.
-- [ ] `05-locked.png` — Eine Rampe direkt nach einem Klick mit dem Lade-Overlay.
-- [ ] `06-sync-indicator.png` — Sync-Anzeige in beiden Zuständen (idealerweise als Collage).
-- [ ] `07-chat.png` — Chat-Bereich mit ein paar Beispielnachrichten von verschiedenen Personen.
-- [ ] `08-theme-toggle.png` — Der Sonne/Mond-Schalter, ggf. zwei Bilder (heller / dunkler Modus).
-- [ ] `09-user-badge.png` — Nahaufnahme der Benutzer-Anzeige oben rechts.
