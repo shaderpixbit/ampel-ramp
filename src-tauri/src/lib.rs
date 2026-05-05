@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tauri::command;
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
-const MAX_CHAT_MESSAGES: usize = 10;
+const MAX_CHAT_MESSAGES: usize = 100;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Ramp {
