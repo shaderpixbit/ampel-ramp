@@ -55,13 +55,16 @@
         }, 4000);
     }
 
-    let bueroKeyHandler: (e: KeyboardEvent) => void;
-
     onMount(async () => {
         try {
             currentUser = await invoke("get_current_user");
         } catch (e) {
             console.error("Failed to get current user:", e);
+        }
+        try {
+            userRole = await invoke("get_user_role", { username: currentUser });
+        } catch (e) {
+            console.error("Failed to get user role:", e);
         }
 
         await fetchRamps();
@@ -79,21 +82,12 @@
         await fetchDailyLog();
         syncTimeout = window.setTimeout(startPolling, 1500);
 
-        bueroKeyHandler = (e: KeyboardEvent) => {
-            if (e.ctrlKey && e.key.toLowerCase() === "b") {
-                e.preventDefault();
-                isBuero = !isBuero;
-                if (!isBuero) showProtocol = false;
-            }
-        };
-        window.addEventListener("keydown", bueroKeyHandler);
     });
 
     onDestroy(() => {
         clearTimeout(syncTimeout);
         clearTimeout(errorTimeout);
         clearInterval(clockInterval);
-        if (bueroKeyHandler) window.removeEventListener("keydown", bueroKeyHandler);
     });
 
     async function startPolling() {
@@ -263,7 +257,9 @@
             : 0,
     );
 
-    let isBuero = $state(false);
+    let userRole = $state('member_lager');
+    let isBuero = $derived(userRole === 'admin' || userRole === 'member_buero');
+    let isAdmin = $derived(userRole === 'admin');
     let focusTrap: HTMLElement;
     let rampsA = $derived([...ramps].filter(r => r.id >= 30 && r.id <= 42).sort((a, b) => b.id - a.id));
     let rampsB = $derived([...ramps].filter(r => r.id >= 43 && r.id <= 57).sort((a, b) => b.id - a.id));
@@ -336,6 +332,40 @@
 
     let dailyLog = $state<RampEvent[]>([]);
     let showProtocol = $state(false);
+
+    // ── User management ──
+    interface UserEntry { username: string; role: string; }
+    let showUserMgmt = $state(false);
+    let allUsers = $state<UserEntry[]>([]);
+    let userMgmtLoading = $state(false);
+
+    async function openUserMgmt() {
+        userMgmtLoading = true;
+        showUserMgmt = true;
+        try {
+            allUsers = await invoke<UserEntry[]>("get_all_users");
+        } catch (e) {
+            console.error("Failed to load users:", e);
+        } finally {
+            userMgmtLoading = false;
+        }
+    }
+
+    async function changeUserRole(username: string, newRole: string) {
+        try {
+            await invoke("set_user_role", { username, role: newRole });
+            allUsers = allUsers.map(u => u.username === username ? { ...u, role: newRole } : u);
+        } catch (e) {
+            console.error("Failed to set user role:", e);
+            showError("Rolle konnte nicht gesetzt werden.");
+        }
+    }
+
+    function roleLabel(role: string): string {
+        if (role === 'admin') return 'Admin';
+        if (role === 'member_buero') return 'Büro';
+        return 'Lager';
+    }
 
     // Average time (minutes) spent in any occupied state today
     let avgDwellToday = $derived(
@@ -562,11 +592,29 @@
         </button>
         {/if}
 
-        <!-- Büroversion badge -->
-        {#if isBuero}
+        <!-- Admin: user management button -->
+        {#if isAdmin}
+        <button
+            onclick={openUserMgmt}
+            class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
+            style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
+            aria-label="Benutzerverwaltung öffnen"
+        >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Benutzer
+        </button>
+        {/if}
+
+        <!-- Role badge -->
+        {#if isAdmin}
             <div class="flex items-center gap-1.5 px-3 py-1 rounded-lg font-mono text-[11px] font-semibold uppercase"
                  style="background: rgba(218,43,41,0.2); border: 1px solid rgba(218,43,41,0.4); color: #FF6B69; letter-spacing: 1px;">
-                BÜRO · STRG+B
+                ADMIN
+            </div>
+        {:else if userRole === 'member_buero'}
+            <div class="flex items-center gap-1.5 px-3 py-1 rounded-lg font-mono text-[11px] font-semibold uppercase"
+                 style="background: rgba(218,43,41,0.15); border: 1px solid rgba(218,43,41,0.3); color: #FF6B69; letter-spacing: 1px;">
+                BÜRO
             </div>
         {/if}
 
@@ -661,7 +709,7 @@
                     class="font-mono text-[10px] uppercase tracking-[0.8px] mt-[1px]"
                     style="color: rgba(255,255,255,0.45);"
                 >
-                    Operator
+                    {roleLabel(userRole)}
                 </div>
             </div>
         </div>
@@ -703,13 +751,7 @@
                         style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
                         >Klick</kbd
                     >
-                    Status · KFZ anklicken zum Bearbeiten ·
-                    <kbd
-                        class="px-[7px] py-[2px] rounded-[5px] font-mono text-[10.5px]"
-                        style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
-                        >STRG+B</kbd
-                    >
-                    Büromodus
+                    Status · KFZ anklicken zum Bearbeiten
                 </div>
             </div>
 
@@ -1456,6 +1498,96 @@
                         </tbody>
                     </table>
                 {/if}
+            </div>
+        </div>
+    </div>
+{/if}
+
+<!-- ── Benutzerverwaltung Modal ── -->
+{#if showUserMgmt}
+    <div
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
+        onclick={(e) => { if (e.target === e.currentTarget) showUserMgmt = false; }}
+        onkeydown={(e) => { if (e.key === "Escape") showUserMgmt = false; }}
+        role="dialog" tabindex="-1" aria-modal="true" aria-label="Benutzerverwaltung"
+    >
+        <div class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+             style="width: 520px; max-width: 96vw; max-height: 80vh; background: var(--tr-surface); border: 1px solid var(--tr-line);">
+
+            <!-- Header -->
+            <div class="flex items-center gap-4 px-6 py-4 shrink-0"
+                 style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);">
+                <div class="flex-1">
+                    <div class="text-[15px] font-semibold" style="color:#fff;">Benutzerverwaltung</div>
+                    <div class="font-mono text-[10.5px] uppercase mt-[3px]"
+                         style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);">
+                        {allUsers.length} Benutzer registriert
+                    </div>
+                </div>
+                <button onclick={() => (showUserMgmt = false)} aria-label="Schließen"
+                        class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                        style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- User list -->
+            <div class="flex-1 overflow-auto chat-scroll p-4">
+                {#if userMgmtLoading}
+                    <div class="flex items-center justify-center py-12 gap-3" style="color:var(--tr-text-faint);">
+                        <div class="w-5 h-5 rounded-full animate-spin" style="border:2px solid var(--tr-line); border-top-color:var(--tr-green);"></div>
+                        Lade…
+                    </div>
+                {:else if allUsers.length === 0}
+                    <p class="text-center py-12 text-sm" style="color:var(--tr-text-faint);">Keine Benutzer gefunden.</p>
+                {:else}
+                    <table class="w-full border-collapse">
+                        <thead>
+                            <tr style="border-bottom:1px solid var(--tr-line);">
+                                <th class="text-left font-mono text-[10px] uppercase pb-2.5 px-2" style="letter-spacing:1px; color:var(--tr-text-faint);">Benutzer</th>
+                                <th class="text-left font-mono text-[10px] uppercase pb-2.5 px-2" style="letter-spacing:1px; color:var(--tr-text-faint);">Rolle</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#each allUsers as u (u.username)}
+                                <tr style="border-bottom:1px solid var(--tr-line);">
+                                    <td class="py-2.5 px-2">
+                                        <div class="flex items-center gap-2">
+                                            <div class="w-6 h-6 rounded-full grid place-items-center text-[10px] font-semibold shrink-0"
+                                                 style="background:var(--tr-red); color:#fff;">
+                                                {u.username.charAt(0).toUpperCase()}
+                                            </div>
+                                            <span class="text-[13px]" style="color:var(--tr-text);">{u.username}</span>
+                                            {#if u.username === currentUser}
+                                                <span class="font-mono text-[9px] px-1.5 py-0.5 rounded"
+                                                      style="background:var(--tr-surface2); color:var(--tr-text-faint); border:1px solid var(--tr-line);">Ich</span>
+                                            {/if}
+                                        </div>
+                                    </td>
+                                    <td class="py-2.5 px-2">
+                                        <select
+                                            value={u.role}
+                                            onchange={(e) => changeUserRole(u.username, e.currentTarget.value)}
+                                            class="rounded-[6px] px-2 py-1.5 text-[12px] outline-none cursor-pointer"
+                                            style="background:var(--tr-surface2); border:1px solid var(--tr-line); color:var(--tr-text);"
+                                        >
+                                            <option value="member_lager">Lager (Standard)</option>
+                                            <option value="member_buero">Büro</option>
+                                            <option value="admin">Administrator</option>
+                                        </select>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+            </div>
+
+            <!-- Footer -->
+            <div class="shrink-0 px-4 py-3 text-[11px]"
+                 style="border-top:1px solid var(--tr-line); color:var(--tr-text-faint); background:var(--tr-surface2);">
+                Neue Benutzer erhalten automatisch die Rolle "Lager" wenn sie die App zum ersten Mal öffnen.
             </div>
         </div>
     </div>

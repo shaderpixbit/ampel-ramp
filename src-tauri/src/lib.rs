@@ -59,6 +59,12 @@ struct RampEvent {
     duration_min: Option<i64>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct UserEntry {
+    username: String,
+    role: String,
+}
+
 // ── DB path & connection ─────────────────────────────────────────────────────
 
 fn get_db_path() -> PathBuf {
@@ -120,7 +126,12 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             duration_min    INTEGER
         );
 
-        CREATE INDEX IF NOT EXISTS idx_events_ts ON ramp_events(timestamp);",
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON ramp_events(timestamp);
+
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            role     TEXT NOT NULL DEFAULT 'member_lager'
+        );",
     )?;
     ensure_canonical_ramps(conn)?;
     Ok(())
@@ -489,6 +500,80 @@ fn query_events(conn: &Connection, from: &str, to: &str) -> Result<Vec<RampEvent
     Ok(events)
 }
 
+// ── User-role commands ────────────────────────────────────────────────────────
+
+const VALID_ROLES: &[&str] = &["admin", "member_buero", "member_lager"];
+
+#[command]
+fn get_user_role(state: State<DbState>, username: String) -> Result<String, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+
+    let existing: Option<String> = db
+        .query_row(
+            "SELECT role FROM users WHERE username = ?1",
+            params![username],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(role) = existing {
+        return Ok(role);
+    }
+
+    // First user ever becomes admin; all subsequent new users get member_lager
+    let user_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    let role = if user_count == 0 {
+        "admin".to_string()
+    } else {
+        "member_lager".to_string()
+    };
+
+    db.execute(
+        "INSERT INTO users (username, role) VALUES (?1, ?2)",
+        params![username, role],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(role)
+}
+
+#[command]
+fn set_user_role(state: State<DbState>, username: String, role: String) -> Result<(), String> {
+    if !VALID_ROLES.contains(&role.as_str()) {
+        return Err(format!("Invalid role '{}'", role));
+    }
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT INTO users (username, role) VALUES (?1, ?2)
+         ON CONFLICT(username) DO UPDATE SET role = excluded.role",
+        params![username, role],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[command]
+fn get_all_users(state: State<DbState>) -> Result<Vec<UserEntry>, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = db
+        .prepare("SELECT username, role FROM users ORDER BY username")
+        .map_err(|e| e.to_string())?;
+    let users: Vec<UserEntry> = stmt
+        .query_map([], |row| {
+            Ok(UserEntry {
+                username: row.get(0)?,
+                role: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(users)
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -506,7 +591,10 @@ pub fn run() {
             get_messages,
             send_message,
             get_daily_log,
-            get_events_for_period
+            get_events_for_period,
+            get_user_role,
+            set_user_role,
+            get_all_users,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
