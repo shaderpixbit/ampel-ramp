@@ -138,6 +138,7 @@
             status: newStatus,
             last_updated_by: currentUser,
             last_updated_at: now_iso,
+            ...(newStatus === "free" && { kennzeichen: null, notiz: null }),
         };
         const index = ramps.findIndex((r) => r.id === ramp.id);
         const oldRamp = index !== -1 ? { ...ramps[index] } : null;
