@@ -1,30 +1,25 @@
-use chrono::{Datelike, Local, TimeZone};
-use fs4::fs_std::FileExt;
+use chrono::{Local, TimeZone};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use tauri::command;
+use std::sync::Mutex;
+use tauri::{command, State};
+
+// ── Constants ────────────────────────────────────────────────────────────────
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
 const MAX_CHAT_MESSAGES: usize = 100;
-const MAX_LOG_EVENTS_PER_MONTH: usize = 5000;
 
+/// Section A: Tor 30–42 (13 ramps). Adjust here if numbering changes.
 const SECTION_A: &[u32] = &[42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30];
+/// Section B: Tor 43–57 (15 ramps). Adjust here if numbering changes.
 const SECTION_B: &[u32] = &[57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43];
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct RampEvent {
-    timestamp: String,
-    ramp_id: u32,
-    from_status: String,
-    to_status: String,
-    user: String,
-    kennzeichen: Option<String>,
-    duration_min: Option<i64>,
-    #[serde(default)]
-    reserviert_fuer: Option<String>,
-}
+// ── Shared DB state ──────────────────────────────────────────────────────────
+
+pub struct DbState(pub Mutex<Connection>);
+
+// ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Ramp {
@@ -33,7 +28,6 @@ struct Ramp {
     status: String,
     last_updated_by: String,
     last_updated_at: Option<String>,
-    // Unix ms timestamp until which this ramp is locked for all clients
     #[serde(default)]
     locked_until: Option<i64>,
     #[serde(default)]
@@ -52,184 +46,227 @@ struct ChatMessage {
     timestamp: String,
 }
 
-fn get_db_path() -> PathBuf {
-    // Save state file right next to the executable on the network drive
-    let mut path = std::env::current_exe()
-        .or_else(|_| std::env::current_dir())
-        .expect("Cannot determine executable or working directory path");
-    path.pop(); // Remove executable name
-    path.push("ramps_state.json");
-    path
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RampEvent {
+    timestamp: String,
+    ramp_id: u32,
+    from_status: String,
+    to_status: String,
+    user: String,
+    kennzeichen: Option<String>,
+    #[serde(default)]
+    reserviert_fuer: Option<String>,
+    duration_min: Option<i64>,
 }
 
-fn get_log_path_for_month(year: i32, month: u32) -> PathBuf {
+// ── DB path & connection ─────────────────────────────────────────────────────
+
+fn get_db_path() -> PathBuf {
     let mut path = std::env::current_exe()
         .or_else(|_| std::env::current_dir())
         .expect("Cannot determine path");
     path.pop();
-    path.push(format!("ramp_events_{:04}-{:02}.json", year, month));
+    path.push("ampel.db");
     path
 }
 
-fn get_current_log_path() -> PathBuf {
-    let now = Local::now();
-    get_log_path_for_month(now.year(), now.month())
+/// Opens the SQLite database, applies PRAGMAs, and creates the schema.
+/// WAL mode + busy_timeout make it safe on SMB network drives with multiple clients.
+pub fn open_db() -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(get_db_path())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA foreign_keys=ON;",
+    )?;
+    create_schema(&conn)?;
+    Ok(conn)
 }
 
-fn get_chat_path() -> PathBuf {
-    let mut path = std::env::current_exe()
-        .or_else(|_| std::env::current_dir())
-        .expect("Cannot determine executable or working directory path");
-    path.pop();
-    path.push("chat_messages.json");
-    path
+fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ramps (
+            id              INTEGER PRIMARY KEY,
+            name            TEXT    NOT NULL,
+            status          TEXT    NOT NULL DEFAULT 'free',
+            last_updated_by TEXT    NOT NULL DEFAULT '',
+            last_updated_at TEXT,
+            locked_until    INTEGER,
+            kennzeichen     TEXT,
+            notiz           TEXT,
+            reserviert_fuer TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id        TEXT PRIMARY KEY,
+            user      TEXT NOT NULL,
+            text      TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ramp_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT    NOT NULL,
+            ramp_id         INTEGER NOT NULL,
+            from_status     TEXT    NOT NULL,
+            to_status       TEXT    NOT NULL,
+            user            TEXT    NOT NULL,
+            kennzeichen     TEXT,
+            reserviert_fuer TEXT,
+            duration_min    INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON ramp_events(timestamp);",
+    )?;
+    ensure_canonical_ramps(conn)?;
+    Ok(())
 }
 
-/// Parses either RFC3339 ("2026-05-07T12:30:00.000Z") or local space format
-/// ("2026-05-07 14:30:00") and returns Unix milliseconds.
+// ── Ramp helpers ─────────────────────────────────────────────────────────────
+
+/// Inserts any canonical ramps that are not yet in the DB (idempotent).
+fn ensure_canonical_ramps(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    for &id in SECTION_A.iter().chain(SECTION_B.iter()) {
+        conn.execute(
+            "INSERT OR IGNORE INTO ramps (id, name, status, last_updated_by, last_updated_at)
+             VALUES (?1, ?2, 'free', 'System', ?3)",
+            params![id, format!("Ramp {}", id), now],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_all_ramps(conn: &Connection) -> Result<Vec<Ramp>, rusqlite::Error> {
+    let all_ids: Vec<u32> = SECTION_A.iter().chain(SECTION_B.iter()).copied().collect();
+    let mut stmt = conn.prepare(
+        "SELECT id, name, status, last_updated_by, last_updated_at,
+                locked_until, kennzeichen, notiz, reserviert_fuer
+         FROM ramps ORDER BY id",
+    )?;
+    let mut ramps: Vec<Ramp> = stmt
+        .query_map([], |row| {
+            Ok(Ramp {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                status: row.get(2)?,
+                last_updated_by: row.get(3)?,
+                last_updated_at: row.get(4)?,
+                locked_until: row.get(5)?,
+                kennzeichen: row.get(6)?,
+                notiz: row.get(7)?,
+                reserviert_fuer: row.get(8)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Sort to canonical order (Section A then B)
+    ramps.sort_by_key(|r| all_ids.iter().position(|&id| id == r.id).unwrap_or(usize::MAX));
+    Ok(ramps)
+}
+
 fn parse_ts_millis(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
     }
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Local.from_local_datetime(&ndt).single().map(|dt| dt.timestamp_millis());
+        return Local
+            .from_local_datetime(&ndt)
+            .single()
+            .map(|dt| dt.timestamp_millis());
     }
     None
 }
 
-fn append_event(event: RampEvent) {
-    let path = get_current_log_path();
-    let Ok(mut file) = open_state_file(&path) else { return };
-    let mut contents = String::new();
-    let _ = file.read_to_string(&mut contents);
-    let mut events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
-    events.push(event);
-    if events.len() > MAX_LOG_EVENTS_PER_MONTH {
-        let drain = events.len() - MAX_LOG_EVENTS_PER_MONTH;
-        events.drain(0..drain);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(&events) {
-        let _ = file.seek(SeekFrom::Start(0));
-        let _ = file.write_all(json.as_bytes());
-        let _ = file.set_len(json.len() as u64);
-    }
-    let _ = file.unlock();
+// ── Migration from legacy JSON files ─────────────────────────────────────────
+
+/// Called once on startup. Reads the old JSON files if they exist and imports
+/// their data into SQLite, then renames them to *.bak so the migration never
+/// runs again but the originals are preserved as a safety copy.
+pub fn migrate_from_json(conn: &Connection) {
+    import_ramps_json(conn);
+    import_chat_json(conn);
+    import_events_json(conn);
 }
 
-fn make_default_ramp(id: u32, now: &str) -> Ramp {
-    Ramp {
-        id,
-        name: format!("Ramp {}", id),
-        status: "free".to_string(),
-        last_updated_by: "System".to_string(),
-        last_updated_at: Some(now.to_string()),
-        locked_until: None,
-        kennzeichen: None,
-        notiz: None,
-        reserviert_fuer: None,
-    }
+fn base_dir() -> PathBuf {
+    let mut p = std::env::current_exe()
+        .or_else(|_| std::env::current_dir())
+        .unwrap();
+    p.pop();
+    p
 }
 
-fn initialize_state() -> Vec<Ramp> {
-    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    SECTION_A
-        .iter()
-        .chain(SECTION_B.iter())
-        .map(|&id| make_default_ramp(id, &now))
-        .collect()
+fn import_ramps_json(conn: &Connection) {
+    let src = base_dir().join("ramps_state.json");
+    if !src.exists() { return; }
+    let Ok(text) = std::fs::read_to_string(&src) else { return };
+    let Ok(ramps) = serde_json::from_str::<Vec<Ramp>>(&text) else { return };
+    for r in ramps {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO ramps
+             (id, name, status, last_updated_by, last_updated_at,
+              locked_until, kennzeichen, notiz, reserviert_fuer)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                r.id, r.name, r.status, r.last_updated_by, r.last_updated_at,
+                r.locked_until, r.kennzeichen, r.notiz, r.reserviert_fuer
+            ],
+        );
+    }
+    let _ = std::fs::rename(&src, base_dir().join("ramps_state.json.bak"));
+    eprintln!("Migrated ramps_state.json → SQLite");
 }
 
-/// Ensures the ramp list is canonical: keeps existing ramps whose IDs are in
-/// SECTION_A or SECTION_B, adds missing ones with default state, and sorts to
-/// canonical order (A then B). Returns (ramps, dirty) where dirty=true means
-/// at least one ramp was added or removed.
-fn ensure_canonical(ramps: Vec<Ramp>) -> (Vec<Ramp>, bool) {
-    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let all_ids: Vec<u32> = SECTION_A.iter().chain(SECTION_B.iter()).copied().collect();
-    let mut dirty = false;
-
-    // Remove ramps whose IDs are not in the canonical set
-    let before_len = ramps.len();
-    let mut canonical: Vec<Ramp> = ramps
-        .into_iter()
-        .filter(|r| all_ids.contains(&r.id))
-        .collect();
-    if canonical.len() != before_len {
-        dirty = true;
+fn import_chat_json(conn: &Connection) {
+    let src = base_dir().join("chat_messages.json");
+    if !src.exists() { return; }
+    let Ok(text) = std::fs::read_to_string(&src) else { return };
+    let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&text) else { return };
+    for m in msgs {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO chat_messages (id, user, text, timestamp)
+             VALUES (?1,?2,?3,?4)",
+            params![m.id, m.user, m.text, m.timestamp],
+        );
     }
-
-    // Add any missing ramps
-    let existing_ids: Vec<u32> = canonical.iter().map(|r| r.id).collect();
-    for &id in &all_ids {
-        if !existing_ids.contains(&id) {
-            canonical.push(make_default_ramp(id, &now));
-            dirty = true;
-        }
-    }
-
-    // Sort to canonical order
-    canonical.sort_by_key(|r| {
-        all_ids.iter().position(|&id| id == r.id).unwrap_or(usize::MAX)
-    });
-
-    (canonical, dirty)
+    let _ = std::fs::rename(&src, base_dir().join("chat_messages.json.bak"));
+    eprintln!("Migrated chat_messages.json → SQLite");
 }
 
-/// Opens the state file and acquires an exclusive lock.
-/// Logs a warning if locking fails (e.g. unsupported on some SMB mounts) but continues.
-fn open_state_file(path: &PathBuf) -> Result<File, String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)
-        .map_err(|e| format!("Open error: {}", e))?;
-
-    if let Err(e) = file.lock_exclusive() {
-        eprintln!("Warning: could not acquire exclusive lock ({e}); proceeding without lock");
-    }
-
-    Ok(file)
-}
-
-/// Reads and parses the ramp state from an open file.
-/// Returns (ramps, dirty) where dirty=true means the state was initialized/migrated
-/// and must be written back to disk.
-fn read_state(file: &mut File) -> Result<(Vec<Ramp>, bool), String> {
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Read error: {}", e))?;
-
-    let parsed = if contents.trim().is_empty() {
-        None
-    } else {
-        match serde_json::from_str::<Vec<Ramp>>(&contents) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("Warning: corrupted JSON ({e}), reinitializing state");
-                None
+fn import_events_json(conn: &Connection) {
+    // Import all ramp_events_YYYY-MM.json files found next to the executable
+    let dir = base_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("ramp_events_") && name.ends_with(".json") {
+            let path = entry.path();
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(events) = serde_json::from_str::<Vec<RampEvent>>(&text) else { continue };
+            for e in events {
+                let _ = conn.execute(
+                    "INSERT INTO ramp_events
+                     (timestamp, ramp_id, from_status, to_status, user,
+                      kennzeichen, reserviert_fuer, duration_min)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        e.timestamp, e.ramp_id, e.from_status, e.to_status,
+                        e.user, e.kennzeichen, e.reserviert_fuer, e.duration_min
+                    ],
+                );
             }
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::rename(&path, &bak);
+            eprintln!("Migrated {} → SQLite", name);
         }
-    };
-
-    let (ramps, dirty) = match parsed {
-        None => (initialize_state(), true),
-        Some(r) => ensure_canonical(r),
-    };
-
-    Ok((ramps, dirty))
+    }
 }
 
-/// Serializes ramps and writes them to the beginning of the file, truncating any leftover bytes.
-fn write_state(file: &mut File, ramps: &[Ramp]) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(ramps).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("Seek error: {}", e))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| format!("Write error: {}", e))?;
-    file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
-    Ok(())
-}
+// ── Tauri commands ───────────────────────────────────────────────────────────
 
 #[command]
 fn get_current_user() -> String {
@@ -239,30 +276,22 @@ fn get_current_user() -> String {
 }
 
 #[command]
-fn get_ramps() -> Result<Vec<Ramp>, String> {
-    let path = get_db_path();
-    let mut file = open_state_file(&path)?;
-    let (mut ramps, mut dirty) = read_state(&mut file)?;
-
-    // Clear any locks that have expired so all clients see the ramp become available
+fn get_ramps(state: State<DbState>) -> Result<Vec<Ramp>, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
     let now_ms = Local::now().timestamp_millis();
-    for ramp in ramps.iter_mut() {
-        if ramp.locked_until.map(|ms| ms <= now_ms).unwrap_or(false) {
-            ramp.locked_until = None;
-            dirty = true;
-        }
-    }
 
-    if dirty {
-        write_state(&mut file, &ramps)?;
-    }
+    // Clear expired locks
+    db.execute(
+        "UPDATE ramps SET locked_until = NULL WHERE locked_until IS NOT NULL AND locked_until <= ?1",
+        params![now_ms],
+    )
+    .map_err(|e| e.to_string())?;
 
-    let _ = file.unlock();
-    Ok(ramps)
+    load_all_ramps(&db).map_err(|e| e.to_string())
 }
 
 #[command]
-fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
+fn update_ramp(state: State<DbState>, updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
     if !VALID_STATUSES.contains(&updated_ramp.status.as_str()) {
         return Err(format!(
             "Invalid status '{}': must be one of {:?}",
@@ -270,163 +299,199 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
         ));
     }
 
-    let path = get_db_path();
-    let mut file = open_state_file(&path)?;
-    let (mut ramps, _) = read_state(&mut file)?;
+    let db = state.0.lock().map_err(|e| e.to_string())?;
 
-    if let Some(r) = ramps.iter_mut().find(|r| r.id == updated_ramp.id) {
-        let status_changed = r.status != updated_ramp.status;
-        if status_changed {
-            let duration_min = r.last_updated_at.as_deref()
-                .and_then(parse_ts_millis)
-                .map(|old_ms| (Local::now().timestamp_millis() - old_ms) / 60_000);
-            append_event(RampEvent {
-                timestamp: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                ramp_id: updated_ramp.id,
-                from_status: r.status.clone(),
-                to_status: updated_ramp.status.clone(),
-                user: updated_ramp.last_updated_by.clone(),
-                kennzeichen: updated_ramp.kennzeichen.clone().or_else(|| r.kennzeichen.clone()),
+    // Read old status to detect changes and calculate dwell duration
+    let old: Option<(String, Option<String>)> = db
+        .query_row(
+            "SELECT status, last_updated_at FROM ramps WHERE id = ?1",
+            params![updated_ramp.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let status_changed = old.as_ref().map(|(s, _)| s != &updated_ramp.status).unwrap_or(false);
+
+    if status_changed {
+        let duration_min = old
+            .as_ref()
+            .and_then(|(_, ts)| ts.as_deref())
+            .and_then(parse_ts_millis)
+            .map(|old_ms| (Local::now().timestamp_millis() - old_ms) / 60_000);
+
+        db.execute(
+            "INSERT INTO ramp_events
+             (timestamp, ramp_id, from_status, to_status, user,
+              kennzeichen, reserviert_fuer, duration_min)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                updated_ramp.id,
+                old.as_ref().map(|(s, _)| s.as_str()).unwrap_or("free"),
+                updated_ramp.status,
+                updated_ramp.last_updated_by,
+                updated_ramp.kennzeichen,
+                updated_ramp.reserviert_fuer,
                 duration_min,
-                reserviert_fuer: updated_ramp.reserviert_fuer.clone().or_else(|| r.reserviert_fuer.clone()),
-            });
-        }
-        *r = updated_ramp;
-        // Only lock on status changes — field edits (kennzeichen/notiz) need no lock
-        if status_changed {
-            r.locked_until = Some(Local::now().timestamp_millis() + 2000);
-        }
+            ],
+        )
+        .map_err(|e| e.to_string())?;
     }
 
-    write_state(&mut file, &ramps)?;
-    let _ = file.unlock();
-
-    Ok(ramps)
-}
-
-#[command]
-fn get_daily_log() -> Result<Vec<RampEvent>, String> {
-    let path = get_current_log_path();
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let mut file = open_state_file(&path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Read error: {}", e))?;
-    let _ = file.unlock();
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
-    Ok(events.into_iter().filter(|e| e.timestamp.starts_with(&today)).collect())
-}
-
-/// Returns all events between from_date and to_date (inclusive, "YYYY-MM-DD").
-/// Reads every monthly log file that overlaps the requested range.
-#[command]
-fn get_events_for_period(from_date: String, to_date: String) -> Result<Vec<RampEvent>, String> {
-    let from = chrono::NaiveDate::parse_from_str(&from_date, "%Y-%m-%d")
-        .map_err(|e| format!("Invalid from_date: {}", e))?;
-    let to = chrono::NaiveDate::parse_from_str(&to_date, "%Y-%m-%d")
-        .map_err(|e| format!("Invalid to_date: {}", e))?;
-
-    let to_str = format!("{}T23:59:59", to_date);
-    let mut all: Vec<RampEvent> = Vec::new();
-
-    // Walk month-by-month across the range
-    let mut year = from.year();
-    let mut month = from.month();
-    loop {
-        let path = get_log_path_for_month(year, month);
-        if path.exists() {
-            if let Ok(mut file) = open_state_file(&path) {
-                let mut contents = String::new();
-                let _ = file.read_to_string(&mut contents);
-                let _ = file.unlock();
-                let events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
-                all.extend(events.into_iter().filter(|e| {
-                    e.timestamp.as_str() >= from_date.as_str()
-                        && e.timestamp.as_str() <= to_str.as_str()
-                }));
-            }
-        }
-        if year == to.year() && month == to.month() { break; }
-        if month == 12 { year += 1; month = 1; } else { month += 1; }
-    }
-
-    all.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    Ok(all)
-}
-
-#[command]
-fn get_messages() -> Result<Vec<ChatMessage>, String> {
-    let path = get_chat_path();
-    let mut file = open_state_file(&path)?;
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Read error: {}", e))?;
-    let _ = file.unlock();
-
-    let messages: Vec<ChatMessage> = if contents.trim().is_empty() {
-        Vec::new()
+    let locked_until: Option<i64> = if status_changed {
+        Some(Local::now().timestamp_millis() + 2000)
     } else {
-        serde_json::from_str(&contents).unwrap_or_default()
+        updated_ramp.locked_until
     };
 
-    let start = messages.len().saturating_sub(50);
-    Ok(messages[start..].to_vec())
+    db.execute(
+        "UPDATE ramps SET
+            status          = ?1,
+            last_updated_by = ?2,
+            last_updated_at = ?3,
+            locked_until    = ?4,
+            kennzeichen     = ?5,
+            notiz           = ?6,
+            reserviert_fuer = ?7
+         WHERE id = ?8",
+        params![
+            updated_ramp.status,
+            updated_ramp.last_updated_by,
+            updated_ramp.last_updated_at,
+            locked_until,
+            updated_ramp.kennzeichen,
+            updated_ramp.notiz,
+            updated_ramp.reserviert_fuer,
+            updated_ramp.id,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    load_all_ramps(&db).map_err(|e| e.to_string())
 }
 
 #[command]
-fn send_message(user: String, text: String) -> Result<Vec<ChatMessage>, String> {
+fn get_messages(state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = db
+        .prepare(
+            "SELECT id, user, text, timestamp FROM chat_messages
+             ORDER BY timestamp DESC LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut msgs: Vec<ChatMessage> = stmt
+        .query_map([], |row| {
+            Ok(ChatMessage {
+                id: row.get(0)?,
+                user: row.get(1)?,
+                text: row.get(2)?,
+                timestamp: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    msgs.reverse(); // oldest first for display
+    Ok(msgs)
+}
+
+#[command]
+fn send_message(state: State<DbState>, user: String, text: String) -> Result<Vec<ChatMessage>, String> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return Err("Message cannot be empty".to_string());
     }
 
-    let path = get_chat_path();
-    let mut file = open_state_file(&path)?;
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Read error: {}", e))?;
-
-    let mut messages: Vec<ChatMessage> = if contents.trim().is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&contents).unwrap_or_default()
-    };
-
+    let db = state.0.lock().map_err(|e| e.to_string())?;
     let id = Local::now().timestamp_millis().to_string();
     let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    messages.push(ChatMessage {
-        id,
-        user,
-        text: trimmed,
-        timestamp,
-    });
 
-    if messages.len() > MAX_CHAT_MESSAGES {
-        let drain_to = messages.len() - MAX_CHAT_MESSAGES;
-        messages.drain(0..drain_to);
-    }
+    db.execute(
+        "INSERT INTO chat_messages (id, user, text, timestamp) VALUES (?1,?2,?3,?4)",
+        params![id, user, trimmed, timestamp],
+    )
+    .map_err(|e| e.to_string())?;
 
-    let json = serde_json::to_string_pretty(&messages).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("Seek error: {}", e))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| format!("Write error: {}", e))?;
-    file.set_len(json.len() as u64).map_err(|e| e.to_string())?;
-    let _ = file.unlock();
+    // Trim to MAX_CHAT_MESSAGES
+    db.execute(
+        "DELETE FROM chat_messages WHERE id NOT IN (
+             SELECT id FROM chat_messages ORDER BY timestamp DESC LIMIT ?1
+         )",
+        params![MAX_CHAT_MESSAGES],
+    )
+    .map_err(|e| e.to_string())?;
 
-    let start = messages.len().saturating_sub(50);
-    Ok(messages[start..].to_vec())
+    // Return last 50, oldest first — replicate get_messages logic without re-locking
+    let mut stmt = db
+        .prepare("SELECT id, user, text, timestamp FROM chat_messages ORDER BY timestamp DESC LIMIT 50")
+        .map_err(|e| e.to_string())?;
+    let mut msgs: Vec<ChatMessage> = stmt
+        .query_map([], |row| Ok(ChatMessage {
+            id: row.get(0)?, user: row.get(1)?, text: row.get(2)?, timestamp: row.get(3)?,
+        }))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    msgs.reverse();
+    Ok(msgs)
 }
+
+#[command]
+fn get_daily_log(state: State<DbState>) -> Result<Vec<RampEvent>, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    query_events(&db, &today, &format!("{}T23:59:59", today))
+}
+
+#[command]
+fn get_events_for_period(
+    state: State<DbState>,
+    from_date: String,
+    to_date: String,
+) -> Result<Vec<RampEvent>, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    query_events(&db, &from_date, &format!("{}T23:59:59", to_date))
+}
+
+fn query_events(conn: &Connection, from: &str, to: &str) -> Result<Vec<RampEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT timestamp, ramp_id, from_status, to_status, user,
+                    kennzeichen, reserviert_fuer, duration_min
+             FROM ramp_events
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let events = stmt
+        .query_map(params![from, to], |row| {
+            Ok(RampEvent {
+                timestamp: row.get(0)?,
+                ramp_id: row.get(1)?,
+                from_status: row.get(2)?,
+                to_status: row.get(3)?,
+                user: row.get(4)?,
+                kennzeichen: row.get(5)?,
+                reserviert_fuer: row.get(6)?,
+                duration_min: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(events)
+}
+
+// ── Entry point ──────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let conn = open_db().expect("Failed to open database");
+    migrate_from_json(&conn);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(DbState(Mutex::new(conn)))
         .invoke_handler(tauri::generate_handler![
             get_current_user,
             get_ramps,
