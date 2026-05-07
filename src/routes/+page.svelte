@@ -194,13 +194,11 @@
         chatOpen = false;
     }
 
-    function getDwellTime(ramp: Ramp, currentTime: number): string {
-        if (!ramp.last_updated_at || ramp.status === "free") return "00:00";
-        const ms = currentTime - new Date(ramp.last_updated_at).getTime();
-        const totalMin = Math.max(0, Math.floor(ms / 60000));
-        const h = Math.floor(totalMin / 60);
-        const m = totalMin % 60;
-        return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    function parseTsMs(ts: string): number {
+        const ms = new Date(ts).getTime();
+        if (!isNaN(ms)) return ms;
+        // fallback for "YYYY-MM-DD HH:MM:SS" (backend init format)
+        return new Date(ts.replace(" ", "T")).getTime();
     }
 
     function getStatusTone(status: string) {
@@ -622,7 +620,15 @@
                         {@const locked = isRampLocked(ramp)}
                         {@const tone = getStatusTone(ramp.status)}
                         {@const isFree = ramp.status === "free"}
-                        {@const dwell = getDwellTime(ramp, now)}
+                        {@const dwellSec = (!isFree && ramp.last_updated_at)
+                            ? Math.max(0, Math.floor((now - parseTsMs(ramp.last_updated_at)) / 1000))
+                            : 0}
+                        {@const dwellH = Math.floor(dwellSec / 3600)}
+                        {@const dwellM = Math.floor((dwellSec % 3600) / 60)}
+                        {@const dwellS = dwellSec % 60}
+                        {@const dwell = dwellH > 0
+                            ? `${String(dwellH).padStart(2,"0")}:${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`
+                            : `${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`}
                         {@const dt = ramp.last_updated_at
                             ? new Date(ramp.last_updated_at)
                             : null}
