@@ -55,13 +55,16 @@
         }, 4000);
     }
 
-    let bueroKeyHandler: (e: KeyboardEvent) => void;
-
     onMount(async () => {
         try {
             currentUser = await invoke("get_current_user");
         } catch (e) {
             console.error("Failed to get current user:", e);
+        }
+        try {
+            userRole = await invoke("get_user_role", { username: currentUser });
+        } catch (e) {
+            console.error("Failed to get user role:", e);
         }
 
         await fetchRamps();
@@ -78,22 +81,12 @@
         }, 1000);
         await fetchDailyLog();
         syncTimeout = window.setTimeout(startPolling, 1500);
-
-        bueroKeyHandler = (e: KeyboardEvent) => {
-            if (e.ctrlKey && e.key.toLowerCase() === "b") {
-                e.preventDefault();
-                isBuero = !isBuero;
-                if (!isBuero) showProtocol = false;
-            }
-        };
-        window.addEventListener("keydown", bueroKeyHandler);
     });
 
     onDestroy(() => {
         clearTimeout(syncTimeout);
         clearTimeout(errorTimeout);
         clearInterval(clockInterval);
-        if (bueroKeyHandler) window.removeEventListener("keydown", bueroKeyHandler);
     });
 
     async function startPolling() {
@@ -147,14 +140,20 @@
         // Büromodus:   free → pending → closed → free  (full 3-way cycle)
         const newStatus = isBuero
             ? cycleRampStatus(ramp.status)
-            : ramp.status === "closed" ? "free" : "closed";
+            : ramp.status === "closed"
+              ? "free"
+              : "closed";
         const now_iso = new Date().toISOString();
         const updatedRamp: Ramp = {
             ...ramp,
             status: newStatus,
             last_updated_by: currentUser,
             last_updated_at: now_iso,
-            ...(newStatus === "free" && { kennzeichen: null, notiz: null, reserviert_fuer: null }),
+            ...(newStatus === "free" && {
+                kennzeichen: null,
+                notiz: null,
+                reserviert_fuer: null,
+            }),
         };
         const index = ramps.findIndex((r) => r.id === ramp.id);
         const oldRamp = index !== -1 ? { ...ramps[index] } : null;
@@ -263,10 +262,20 @@
             : 0,
     );
 
-    let isBuero = $state(false);
+    let userRole = $state("member_lager");
+    let isBuero = $derived(userRole === "admin" || userRole === "member_buero");
+    let isAdmin = $derived(userRole === "admin");
     let focusTrap: HTMLElement;
-    let rampsA = $derived([...ramps].filter(r => r.id >= 30 && r.id <= 42).sort((a, b) => b.id - a.id));
-    let rampsB = $derived([...ramps].filter(r => r.id >= 43 && r.id <= 57).sort((a, b) => b.id - a.id));
+    let rampsA = $derived(
+        [...ramps]
+            .filter((r) => r.id >= 30 && r.id <= 42)
+            .sort((a, b) => b.id - a.id),
+    );
+    let rampsB = $derived(
+        [...ramps]
+            .filter((r) => r.id >= 43 && r.id <= 57)
+            .sort((a, b) => b.id - a.id),
+    );
 
     function releaseFocus() {
         requestAnimationFrame(() => focusTrap?.focus());
@@ -337,6 +346,45 @@
     let dailyLog = $state<RampEvent[]>([]);
     let showProtocol = $state(false);
 
+    // ── User management ──
+    interface UserEntry {
+        username: string;
+        role: string;
+    }
+    let showUserMgmt = $state(false);
+    let allUsers = $state<UserEntry[]>([]);
+    let userMgmtLoading = $state(false);
+
+    async function openUserMgmt() {
+        userMgmtLoading = true;
+        showUserMgmt = true;
+        try {
+            allUsers = await invoke<UserEntry[]>("get_all_users");
+        } catch (e) {
+            console.error("Failed to load users:", e);
+        } finally {
+            userMgmtLoading = false;
+        }
+    }
+
+    async function changeUserRole(username: string, newRole: string) {
+        try {
+            await invoke("set_user_role", { username, role: newRole });
+            allUsers = allUsers.map((u) =>
+                u.username === username ? { ...u, role: newRole } : u,
+            );
+        } catch (e) {
+            console.error("Failed to set user role:", e);
+            showError("Rolle konnte nicht gesetzt werden.");
+        }
+    }
+
+    function roleLabel(role: string): string {
+        if (role === "admin") return "Admin";
+        if (role === "member_buero") return "Büro";
+        return "Lager";
+    }
+
     // Average time (minutes) spent in any occupied state today
     let avgDwellToday = $derived(
         (() => {
@@ -405,7 +453,10 @@
     }
 
     async function fetchPeriodEvents(period: StatPeriod) {
-        if (period === "day") { periodEvents = dailyLog; return; }
+        if (period === "day") {
+            periodEvents = dailyLog;
+            return;
+        }
         periodLoading = true;
         try {
             const { from, to } = getPeriodDates(period);
@@ -427,9 +478,14 @@
 
     function computeStats(events: RampEvent[]) {
         const completions = events.filter((e) => e.to_status === "free").length;
-        const dwellEvts = events.filter((e) => e.duration_min !== null && e.from_status !== "free");
+        const dwellEvts = events.filter(
+            (e) => e.duration_min !== null && e.from_status !== "free",
+        );
         const avgDwell = dwellEvts.length
-            ? Math.round(dwellEvts.reduce((s, e) => s + (e.duration_min ?? 0), 0) / dwellEvts.length)
+            ? Math.round(
+                  dwellEvts.reduce((s, e) => s + (e.duration_min ?? 0), 0) /
+                      dwellEvts.length,
+              )
             : null;
         const byDay = new Map<string, number>();
         const byRamp = new Map<number, number>();
@@ -438,8 +494,16 @@
             byDay.set(d, (byDay.get(d) ?? 0) + 1);
             byRamp.set(e.ramp_id, (byRamp.get(e.ramp_id) ?? 0) + 1);
         }
-        const topRampEntry = [...byRamp.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
-        return { totalEvents: events.length, completions, avgDwell, byDay, byRamp, topRampEntry };
+        const topRampEntry =
+            [...byRamp.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
+        return {
+            totalEvents: events.length,
+            completions,
+            avgDwell,
+            byDay,
+            byRamp,
+            topRampEntry,
+        };
     }
 
     let periodStats = $derived(computeStats(periodEvents));
@@ -548,25 +612,82 @@
 
         <!-- Protokoll button — Büromodus only -->
         {#if isBuero}
-        <button
-            onclick={openProtocol}
-            class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
-            style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
-            aria-label="Tagesprotokoll öffnen"
-        >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-            Protokoll
-            {#if dailyLog.length > 0}
-                <span class="font-mono text-[10px]" style="color: rgba(255,255,255,0.45);">{dailyLog.length}</span>
-            {/if}
-        </button>
+            <button
+                onclick={openProtocol}
+                class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
+                style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
+                aria-label="Tagesprotokoll öffnen"
+            >
+                <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    ><path
+                        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                    /><polyline points="14 2 14 8 20 8" /><line
+                        x1="16"
+                        y1="13"
+                        x2="8"
+                        y2="13"
+                    /><line x1="16" y1="17" x2="8" y2="17" /><polyline
+                        points="10 9 9 9 8 9"
+                    /></svg
+                >
+                Protokoll
+                {#if dailyLog.length > 0}
+                    <span
+                        class="font-mono text-[10px]"
+                        style="color: rgba(255,255,255,0.45);"
+                        >{dailyLog.length}</span
+                    >
+                {/if}
+            </button>
         {/if}
 
-        <!-- Büroversion badge -->
-        {#if isBuero}
-            <div class="flex items-center gap-1.5 px-3 py-1 rounded-lg font-mono text-[11px] font-semibold uppercase"
-                 style="background: rgba(218,43,41,0.2); border: 1px solid rgba(218,43,41,0.4); color: #FF6B69; letter-spacing: 1px;">
-                BÜRO · STRG+B
+        <!-- Admin: user management button -->
+        {#if isAdmin}
+            <button
+                onclick={openUserMgmt}
+                class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
+                style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
+                aria-label="Benutzerverwaltung öffnen"
+            >
+                <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    ><path
+                        d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"
+                    /><circle cx="9" cy="7" r="4" /><path
+                        d="M23 21v-2a4 4 0 0 0-3-3.87"
+                    /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></svg
+                >
+                Benutzer
+            </button>
+        {/if}
+
+        <!-- Role badge -->
+        {#if isAdmin}
+            <div
+                class="flex items-center gap-1.5 px-3 py-1 rounded-lg font-mono text-[11px] font-semibold uppercase"
+                style="background: rgba(218,43,41,0.2); border: 1px solid rgba(218,43,41,0.4); color: #FF6B69; letter-spacing: 1px;"
+            >
+                ADMIN
+            </div>
+        {:else if userRole === "member_buero"}
+            <div
+                class="flex items-center gap-1.5 px-3 py-1 rounded-lg font-mono text-[11px] font-semibold uppercase"
+                style="background: rgba(218,43,41,0.15); border: 1px solid rgba(218,43,41,0.3); color: #FF6B69; letter-spacing: 1px;"
+            >
+                BÜRO
             </div>
         {/if}
 
@@ -661,7 +782,7 @@
                     class="font-mono text-[10px] uppercase tracking-[0.8px] mt-[1px]"
                     style="color: rgba(255,255,255,0.45);"
                 >
-                    Operator
+                    {roleLabel(userRole)}
                 </div>
             </div>
         </div>
@@ -671,7 +792,12 @@
     <div class="flex-1 overflow-hidden relative">
         <!-- Main scroll area -->
         <main class="h-full overflow-auto" style="padding: 22px 26px;">
-            <div bind:this={focusTrap} tabindex="-1" class="sr-only" aria-hidden="true"></div>
+            <div
+                bind:this={focusTrap}
+                tabindex="-1"
+                class="sr-only"
+                aria-hidden="true"
+            ></div>
             <!-- Section header -->
             <div class="flex items-end justify-between mb-5 gap-6">
                 <div>
@@ -687,7 +813,8 @@
                         ></span>
                         <span
                             class="font-mono text-[11px] uppercase tracking-[1.6px] font-medium"
-                            style="color: var(--tr-text-faint);">{ramps.length} Rampen</span
+                            style="color: var(--tr-text-faint);"
+                            >{ramps.length} Rampen</span
                         >
                     </div>
                     <h1 class="text-[24px] font-semibold tracking-[-0.4px] m-0">
@@ -703,13 +830,7 @@
                         style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
                         >Klick</kbd
                     >
-                    Status · KFZ anklicken zum Bearbeiten ·
-                    <kbd
-                        class="px-[7px] py-[2px] rounded-[5px] font-mono text-[10.5px]"
-                        style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
-                        >STRG+B</kbd
-                    >
-                    Büromodus
+                    Status · KFZ anklicken zum Bearbeiten
                 </div>
             </div>
 
@@ -718,37 +839,58 @@
                 {@const locked = isRampLocked(ramp)}
                 {@const tone = getStatusTone(ramp.status)}
                 {@const isFree = ramp.status === "free"}
-                {@const dwellSec = (!isFree && ramp.last_updated_at)
-                    ? Math.max(0, Math.floor((now - parseTsMs(ramp.last_updated_at)) / 1000))
-                    : 0}
+                {@const dwellSec =
+                    !isFree && ramp.last_updated_at
+                        ? Math.max(
+                              0,
+                              Math.floor(
+                                  (now - parseTsMs(ramp.last_updated_at)) /
+                                      1000,
+                              ),
+                          )
+                        : 0}
                 {@const dwellH = Math.floor(dwellSec / 3600)}
                 {@const dwellM = Math.floor((dwellSec % 3600) / 60)}
                 {@const dwellS = dwellSec % 60}
-                {@const dwell = dwellH > 0
-                    ? `${String(dwellH).padStart(2,"0")}:${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`
-                    : `${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`}
-                {@const dt = ramp.last_updated_at ? new Date(ramp.last_updated_at) : null}
+                {@const dwell =
+                    dwellH > 0
+                        ? `${String(dwellH).padStart(2, "0")}:${String(dwellM).padStart(2, "0")}:${String(dwellS).padStart(2, "0")}`
+                        : `${String(dwellM).padStart(2, "0")}:${String(dwellS).padStart(2, "0")}`}
+                {@const dt = ramp.last_updated_at
+                    ? new Date(ramp.last_updated_at)
+                    : null}
                 {@const timeStr = dt
-                    ? dt.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })
+                    ? dt.toLocaleTimeString("de-DE", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                      })
                     : null}
                 {@const canEdit = isConnected && !isUpdating && !locked}
-                {@const isEditKfz = editingField?.rampId === ramp.id && editingField?.field === "kennzeichen"}
-                {@const isEditRes = editingField?.rampId === ramp.id && editingField?.field === "reserviert_fuer"}
+                {@const isEditKfz =
+                    editingField?.rampId === ramp.id &&
+                    editingField?.field === "kennzeichen"}
+                {@const isEditRes =
+                    editingField?.rampId === ramp.id &&
+                    editingField?.field === "reserviert_fuer"}
 
                 <!-- div+role avoids invalid nested-interactive HTML -->
                 <div
                     class="ramp-tile relative rounded-[12px] flex flex-col gap-[7px]"
                     role="button"
                     tabindex="0"
-                    aria-label="Rampe {ramp.id}, {getStatusLabel(ramp.status)}. Enter um Status zu ändern."
+                    aria-label="Rampe {ramp.id}, {getStatusLabel(
+                        ramp.status,
+                    )}. Enter um Status zu ändern."
                     onclick={(e) => {
                         // Only block clicks that land directly on an active input
                         // Field buttons handle their own stopPropagation
-                        if ((e.target as HTMLElement).tagName === "INPUT") return;
+                        if ((e.target as HTMLElement).tagName === "INPUT")
+                            return;
                         if (canEdit) cycleStatus(ramp);
                     }}
                     onkeydown={(e) => {
-                        if ((e.target as HTMLElement).tagName === "INPUT") return;
+                        if ((e.target as HTMLElement).tagName === "INPUT")
+                            return;
                         if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
                             if (canEdit) cycleStatus(ramp);
@@ -758,10 +900,16 @@
                         padding: 10px 10px 8px;
                         cursor: {canEdit ? 'pointer' : 'default'};
                         background: {isFree
-                            ? 'var(--tr-surface)'
-                            : 'linear-gradient(180deg, ' + tone.bg + ' 0%, var(--tr-surface) 72%)'};
-                        border: 1px solid {isFree ? 'var(--tr-line)' : tone.line};
-                        box-shadow: {isFree ? 'none' : '0 0 24px -10px ' + tone.glow};
+                        ? 'var(--tr-surface)'
+                        : 'linear-gradient(180deg, ' +
+                          tone.bg +
+                          ' 0%, var(--tr-surface) 72%)'};
+                        border: 1px solid {isFree
+                        ? 'var(--tr-line)'
+                        : tone.line};
+                        box-shadow: {isFree
+                        ? 'none'
+                        : '0 0 24px -10px ' + tone.glow};
                     "
                 >
                     <!-- Lock overlay -->
@@ -770,14 +918,19 @@
                             class="absolute inset-0 z-30 rounded-[12px] flex items-center justify-center backdrop-blur-[1px]"
                             style="background: rgba(0,0,0,0.28);"
                         >
-                            <LoaderCircleIcon class="w-5 h-5 animate-spin" style="color:#fff" />
+                            <LoaderCircleIcon
+                                class="w-5 h-5 animate-spin"
+                                style="color:#fff"
+                            />
                         </div>
                     {/if}
 
                     <!-- Top accent stripe -->
                     <div
                         class="absolute top-0 left-0 right-0 h-[3px] rounded-t-[12px]"
-                        style="background: {tone.fg}; opacity: {isFree ? 0.35 : 1};"
+                        style="background: {tone.fg}; opacity: {isFree
+                            ? 0.35
+                            : 1};"
                     ></div>
 
                     <!-- Row 1: number + status badge -->
@@ -794,7 +947,12 @@
                         >
                             <span
                                 class="w-[5px] h-[5px] rounded-full flex-shrink-0"
-                                style="background: {tone.fg}; box-shadow: {!isFree ? '0 0 5px ' + tone.glow : 'none'}; animation: {ramp.status === 'pending' ? 'mc-pulse 1.6s ease-in-out infinite' : 'none'};"
+                                style="background: {tone.fg}; box-shadow: {!isFree
+                                    ? '0 0 5px ' + tone.glow
+                                    : 'none'}; animation: {ramp.status ===
+                                'pending'
+                                    ? 'mc-pulse 1.6s ease-in-out infinite'
+                                    : 'none'};"
                             ></span>
                             {tone.label}
                         </span>
@@ -804,13 +962,18 @@
                     <div
                         data-field="kennzeichen"
                         class="rounded-[4px] overflow-hidden"
-                        style="border: 1px solid {isEditKfz ? 'var(--tr-warning)' : 'var(--tr-line)'}; background: var(--tr-surface2);"
+                        style="border: 1px solid {isEditKfz
+                            ? 'var(--tr-warning)'
+                            : 'var(--tr-line)'}; background: var(--tr-surface2);"
                     >
                         {#if isEditKfz}
-                            <div class="flex items-center gap-1 px-[7px] py-[4px]">
+                            <div
+                                class="flex items-center gap-1 px-[7px] py-[4px]"
+                            >
                                 <span
                                     class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
-                                    style="letter-spacing:1px; color:var(--tr-text-faint);">KFZ</span
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                    >KFZ</span
                                 >
                                 <input
                                     type="text"
@@ -819,11 +982,21 @@
                                     value={editingField!.value}
                                     maxlength={15}
                                     placeholder="z.B. M-TR 2418"
-                                    oninput={(e) => { if (editingField) editingField.value = e.currentTarget.value; }}
+                                    oninput={(e) => {
+                                        if (editingField)
+                                            editingField.value =
+                                                e.currentTarget.value;
+                                    }}
                                     onblur={() => commitFieldEdit(ramp)}
                                     onkeydown={(e) => {
-                                        if (e.key === "Enter") { e.preventDefault(); commitFieldEdit(ramp); }
-                                        if (e.key === "Escape") { e.preventDefault(); cancelFieldEdit(); }
+                                        if (e.key === "Enter") {
+                                            e.preventDefault();
+                                            commitFieldEdit(ramp);
+                                        }
+                                        if (e.key === "Escape") {
+                                            e.preventDefault();
+                                            cancelFieldEdit();
+                                        }
                                     }}
                                     onclick={(e) => e.stopPropagation()}
                                     use:focusInput
@@ -832,19 +1005,27 @@
                         {:else}
                             <button
                                 class="w-full flex items-center gap-1 px-[7px] py-[4px] text-left"
-                                style="background:transparent; border:none; cursor:{canEdit ? 'text' : 'default'};"
+                                style="background:transparent; border:none; cursor:{canEdit
+                                    ? 'text'
+                                    : 'default'};"
                                 disabled={!canEdit}
-                                onclick={(e) => { e.stopPropagation(); startFieldEdit(ramp, "kennzeichen"); }}
+                                onclick={(e) => {
+                                    e.stopPropagation();
+                                    startFieldEdit(ramp, "kennzeichen");
+                                }}
                                 aria-label="Kennzeichen bearbeiten"
                                 tabindex="-1"
                             >
                                 <span
                                     class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
-                                    style="letter-spacing:1px; color:var(--tr-text-faint);">LKW</span
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                    >LKW</span
                                 >
                                 <span
                                     class="font-mono text-[11px] font-medium truncate"
-                                    style="color:{ramp.kennzeichen ? 'var(--tr-text)' : 'var(--tr-text-faint)'}; letter-spacing:0.5px;"
+                                    style="color:{ramp.kennzeichen
+                                        ? 'var(--tr-text)'
+                                        : 'var(--tr-text-faint)'}; letter-spacing:0.5px;"
                                 >
                                     {ramp.kennzeichen || "— — —"}
                                 </span>
@@ -857,13 +1038,18 @@
                         <div
                             data-field="reserviert_fuer"
                             class="rounded-[4px] overflow-hidden"
-                            style="border: 1px solid {isEditRes ? 'var(--tr-warning)' : 'var(--tr-line)'}; background: var(--tr-surface2);"
+                            style="border: 1px solid {isEditRes
+                                ? 'var(--tr-warning)'
+                                : 'var(--tr-line)'}; background: var(--tr-surface2);"
                         >
                             {#if isEditRes}
-                                <div class="flex items-center gap-1 px-[7px] py-[4px]">
+                                <div
+                                    class="flex items-center gap-1 px-[7px] py-[4px]"
+                                >
                                     <span
                                         class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
-                                        style="letter-spacing:1px; color:var(--tr-text-faint);">Res.</span
+                                        style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                        >Res.</span
                                     >
                                     <input
                                         type="text"
@@ -872,11 +1058,21 @@
                                         value={editingField!.value}
                                         maxlength={40}
                                         placeholder="Reserviert für…"
-                                        oninput={(e) => { if (editingField) editingField.value = e.currentTarget.value; }}
+                                        oninput={(e) => {
+                                            if (editingField)
+                                                editingField.value =
+                                                    e.currentTarget.value;
+                                        }}
                                         onblur={() => commitFieldEdit(ramp)}
                                         onkeydown={(e) => {
-                                            if (e.key === "Enter") { e.preventDefault(); commitFieldEdit(ramp); }
-                                            if (e.key === "Escape") { e.preventDefault(); cancelFieldEdit(); }
+                                            if (e.key === "Enter") {
+                                                e.preventDefault();
+                                                commitFieldEdit(ramp);
+                                            }
+                                            if (e.key === "Escape") {
+                                                e.preventDefault();
+                                                cancelFieldEdit();
+                                            }
                                         }}
                                         onclick={(e) => e.stopPropagation()}
                                         use:focusInput
@@ -885,31 +1081,45 @@
                             {:else if isBuero}
                                 <button
                                     class="w-full flex items-center gap-1 px-[7px] py-[4px] text-left"
-                                    style="background:transparent; border:none; cursor:{canEdit ? 'text' : 'default'};"
+                                    style="background:transparent; border:none; cursor:{canEdit
+                                        ? 'text'
+                                        : 'default'};"
                                     disabled={!canEdit}
-                                    onclick={(e) => { e.stopPropagation(); startFieldEdit(ramp, "reserviert_fuer"); }}
+                                    onclick={(e) => {
+                                        e.stopPropagation();
+                                        startFieldEdit(ramp, "reserviert_fuer");
+                                    }}
                                     aria-label="Reserviert-für bearbeiten"
                                     tabindex="-1"
                                 >
                                     <span
                                         class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
-                                        style="letter-spacing:1px; color:var(--tr-text-faint);">Res.</span
+                                        style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                        >Res.</span
                                     >
                                     <span
                                         class="text-[11px] truncate"
-                                        style="color:{ramp.reserviert_fuer ? 'var(--tr-text-dim)' : 'var(--tr-text-faint)'};"
+                                        style="color:{ramp.reserviert_fuer
+                                            ? 'var(--tr-text-dim)'
+                                            : 'var(--tr-text-faint)'};"
                                     >
                                         {ramp.reserviert_fuer || "—"}
                                     </span>
                                 </button>
                             {:else}
                                 <!-- Normal mode, read-only display when value is set -->
-                                <div class="flex items-center gap-1 px-[7px] py-[4px]">
+                                <div
+                                    class="flex items-center gap-1 px-[7px] py-[4px]"
+                                >
                                     <span
                                         class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
-                                        style="letter-spacing:1px; color:var(--tr-text-faint);">Res.</span
+                                        style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                        >Res.</span
                                     >
-                                    <span class="text-[11px] truncate" style="color:var(--tr-text-dim);">
+                                    <span
+                                        class="text-[11px] truncate"
+                                        style="color:var(--tr-text-dim);"
+                                    >
                                         {ramp.reserviert_fuer}
                                     </span>
                                 </div>
@@ -941,7 +1151,10 @@
                                 >
                                     Seit
                                 </div>
-                                <div class="text-[11px] font-medium" style="color:var(--tr-text-dim);">
+                                <div
+                                    class="text-[11px] font-medium"
+                                    style="color:var(--tr-text-dim);"
+                                >
                                     {timeStr ?? "—"}
                                 </div>
                             </div>
@@ -950,7 +1163,9 @@
                                 class="font-mono text-[9px]"
                                 style="color:var(--tr-text-faint); letter-spacing:0.4px;"
                             >
-                                {timeStr ? "Frei seit " + timeStr : "Noch nie belegt"}
+                                {timeStr
+                                    ? "Frei seit " + timeStr
+                                    : "Noch nie belegt"}
                             </div>
                         {/if}
                     </div>
@@ -972,11 +1187,15 @@
             {:else}
                 <!-- Section A -->
                 <div class="mb-5">
-                    <div class="font-mono text-[10px] uppercase tracking-[1.6px] font-medium mb-2"
-                         style="color: var(--tr-text-faint);">
+                    <div
+                        class="font-mono text-[10px] uppercase tracking-[1.6px] font-medium mb-2"
+                        style="color: var(--tr-text-faint);"
+                    >
                         01 / Sektor A · Tor 30–42 — {rampsA.length} Rampen
                     </div>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;">
+                    <div
+                        style="display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;"
+                    >
                         {#each rampsA as ramp (ramp.id)}
                             {@render rampTile(ramp)}
                         {/each}
@@ -985,11 +1204,15 @@
 
                 <!-- Section B -->
                 <div>
-                    <div class="font-mono text-[10px] uppercase tracking-[1.6px] font-medium mb-2"
-                         style="color: var(--tr-text-faint);">
+                    <div
+                        class="font-mono text-[10px] uppercase tracking-[1.6px] font-medium mb-2"
+                        style="color: var(--tr-text-faint);"
+                    >
                         02 / Sektor B · Tor 43–57 — {rampsB.length} Rampen
                     </div>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;">
+                    <div
+                        style="display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;"
+                    >
                         {#each rampsB as ramp (ramp.id)}
                             {@render rampTile(ramp)}
                         {/each}
@@ -1013,18 +1236,27 @@
                         <div class="flex items-baseline gap-1.5">
                             <span
                                 class="font-mono text-[22px] font-semibold leading-none tabular-nums"
-                                style="color: {avgDwellToday !== null ? 'var(--tr-warning)' : 'var(--tr-text)'};"
+                                style="color: {avgDwellToday !== null
+                                    ? 'var(--tr-warning)'
+                                    : 'var(--tr-text)'};"
                             >
                                 {avgDwellToday !== null
-                                    ? String(Math.floor(avgDwellToday / 60)).padStart(2, "0") +
+                                    ? String(
+                                          Math.floor(avgDwellToday / 60),
+                                      ).padStart(2, "0") +
                                       ":" +
-                                      String(avgDwellToday % 60).padStart(2, "0")
+                                      String(avgDwellToday % 60).padStart(
+                                          2,
+                                          "0",
+                                      )
                                     : "—"}
                             </span>
                             <span
                                 class="text-[10px] uppercase tracking-[0.6px]"
                                 style="color: var(--tr-text-faint);"
-                                >{avgDwellToday !== null ? "HH:MM" : "keine Daten"}</span
+                                >{avgDwellToday !== null
+                                    ? "HH:MM"
+                                    : "keine Daten"}</span
                             >
                         </div>
                     </div>
@@ -1288,70 +1520,141 @@
 {#if showProtocol}
     {@const stats = periodStats}
     {@const dayEntries = [...periodEvents].reverse()}
-    {@const dayMap = [...stats.byDay.entries()].sort((a,b) => a[0].localeCompare(b[0]))}
-    {@const maxDayCount = dayMap.length ? Math.max(...dayMap.map(([,n]) => n)) : 1}
-    {@const topRamps = [...stats.byRamp.entries()].sort((a,b) => b[1]-a[1]).slice(0,5)}
+    {@const dayMap = [...stats.byDay.entries()].sort((a, b) =>
+        a[0].localeCompare(b[0]),
+    )}
+    {@const maxDayCount = dayMap.length
+        ? Math.max(...dayMap.map(([, n]) => n))
+        : 1}
+    {@const topRamps = [...stats.byRamp.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)}
     <div
         class="fixed inset-0 z-50 flex items-center justify-center"
         style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
-        onclick={(e) => { if (e.target === e.currentTarget) showProtocol = false; }}
-        onkeydown={(e) => { if (e.key === "Escape") showProtocol = false; }}
-        role="dialog" tabindex="-1" aria-modal="true" aria-label="Protokoll & Statistik"
+        onclick={(e) => {
+            if (e.target === e.currentTarget) showProtocol = false;
+        }}
+        onkeydown={(e) => {
+            if (e.key === "Escape") showProtocol = false;
+        }}
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-label="Protokoll & Statistik"
     >
-        <div class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
-             style="width: 1140px; max-width: 96vw; max-height: 88vh; background: var(--tr-surface); border: 1px solid var(--tr-line);">
-
+        <div
+            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+            style="width: 1140px; max-width: 96vw; max-height: 88vh; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+        >
             <!-- Header -->
-            <div class="flex items-center gap-4 px-6 py-4 shrink-0"
-                 style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);">
+            <div
+                class="flex items-center gap-4 px-6 py-4 shrink-0"
+                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
+            >
                 <div class="flex-1">
-                    <div class="text-[15px] font-semibold" style="color:#fff;">Protokoll & Statistik</div>
-                    <div class="font-mono text-[10.5px] uppercase mt-[3px]"
-                         style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);">
-                        {new Date().toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"})}
+                    <div class="text-[15px] font-semibold" style="color:#fff;">
+                        Protokoll & Statistik
+                    </div>
+                    <div
+                        class="font-mono text-[10.5px] uppercase mt-[3px]"
+                        style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);"
+                    >
+                        {new Date().toLocaleDateString("de-DE", {
+                            weekday: "long",
+                            day: "2-digit",
+                            month: "2-digit",
+                            year: "numeric",
+                        })}
                         &nbsp;·&nbsp; {stats.totalEvents} Ereignisse
                     </div>
                 </div>
                 <!-- Period tabs -->
-                <div class="flex gap-1" style="background:rgba(255,255,255,0.06); padding:3px; border-radius:8px;">
-                    {#each ([["day","Tag"],["week","Woche"],["month","Monat"],["year","Jahr"]] as const) as [p, label]}
-                        <button onclick={() => selectPeriod(p)}
-                                class="px-3 py-1 rounded-[6px] font-mono text-[11px] font-semibold uppercase cursor-pointer transition-colors"
-                                style="letter-spacing:0.8px; background:{statPeriod===p?'rgba(255,255,255,0.12)':'transparent'}; color:{statPeriod===p?'#fff':'rgba(255,255,255,0.5)'}; border:none;">
+                <div
+                    class="flex gap-1"
+                    style="background:rgba(255,255,255,0.06); padding:3px; border-radius:8px;"
+                >
+                    {#each [["day", "Tag"], ["week", "Woche"], ["month", "Monat"], ["year", "Jahr"]] as const as [p, label]}
+                        <button
+                            onclick={() => selectPeriod(p)}
+                            class="px-3 py-1 rounded-[6px] font-mono text-[11px] font-semibold uppercase cursor-pointer transition-colors"
+                            style="letter-spacing:0.8px; background:{statPeriod ===
+                            p
+                                ? 'rgba(255,255,255,0.12)'
+                                : 'transparent'}; color:{statPeriod === p
+                                ? '#fff'
+                                : 'rgba(255,255,255,0.5)'}; border:none;"
+                        >
                             {label}
                         </button>
                     {/each}
                 </div>
-                <button onclick={() => window.print()} aria-label="Drucken"
-                        class="h-8 px-3 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
-                        style="border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.8);">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+                <button
+                    onclick={() => window.print()}
+                    aria-label="Drucken"
+                    class="h-8 px-3 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
+                    style="border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.8);"
+                >
+                    <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        ><polyline points="6 9 6 2 18 2 18 9" /><path
+                            d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"
+                        /><rect x="6" y="14" width="12" height="8" /></svg
+                    >
                     Drucken
                 </button>
-                <button onclick={() => (showProtocol = false)} aria-label="Schließen"
-                        class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
-                        style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                <button
+                    onclick={() => (showProtocol = false)}
+                    aria-label="Schließen"
+                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                    style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);"
+                >
+                    <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg
+                    >
                 </button>
             </div>
 
             <!-- Summary strip -->
-            <div class="flex gap-6 px-6 py-3 shrink-0"
-                 style="border-bottom:1px solid var(--tr-line); background:var(--tr-surface2);">
-                {#each [
-                    {label:"Statuswechsel", value:String(stats.totalEvents), color:"var(--tr-text)"},
-                    {label:"Abfertigungen",  value:String(stats.completions),  color:"var(--tr-green)"},
-                    {label:"Ø Verweildauer", value:stats.avgDwell!==null?fmtDuration(stats.avgDwell):"—", color:"var(--tr-warning)"},
-                    {label:"Aktivste Rampe", value:stats.topRampEntry?`Rampe ${stats.topRampEntry[0]} (${stats.topRampEntry[1]}×)`:"—", color:"var(--tr-text)"},
-                ] as s}
+            <div
+                class="flex gap-6 px-6 py-3 shrink-0"
+                style="border-bottom:1px solid var(--tr-line); background:var(--tr-surface2);"
+            >
+                {#each [{ label: "Statuswechsel", value: String(stats.totalEvents), color: "var(--tr-text)" }, { label: "Abfertigungen", value: String(stats.completions), color: "var(--tr-green)" }, { label: "Ø Verweildauer", value: stats.avgDwell !== null ? fmtDuration(stats.avgDwell) : "—", color: "var(--tr-warning)" }, { label: "Aktivste Rampe", value: stats.topRampEntry ? `Rampe ${stats.topRampEntry[0]} (${stats.topRampEntry[1]}×)` : "—", color: "var(--tr-text)" }] as s}
                     <div class="flex flex-col gap-0.5">
-                        <div class="font-mono text-[10px] uppercase font-medium" style="letter-spacing:1px; color:var(--tr-text-faint);">{s.label}</div>
-                        <div class="font-mono text-[16px] font-semibold leading-none" style="color:{s.color};">{s.value}</div>
+                        <div
+                            class="font-mono text-[10px] uppercase font-medium"
+                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                        >
+                            {s.label}
+                        </div>
+                        <div
+                            class="font-mono text-[16px] font-semibold leading-none"
+                            style="color:{s.color};"
+                        >
+                            {s.value}
+                        </div>
                     </div>
                 {/each}
                 {#if periodLoading}
-                    <div class="flex items-center gap-2 ml-auto text-[12px]" style="color:var(--tr-text-faint);">
-                        <div class="w-4 h-4 rounded-full animate-spin" style="border:2px solid var(--tr-line); border-top-color:var(--tr-green);"></div>
+                    <div
+                        class="flex items-center gap-2 ml-auto text-[12px]"
+                        style="color:var(--tr-text-faint);"
+                    >
+                        <div
+                            class="w-4 h-4 rounded-full animate-spin"
+                            style="border:2px solid var(--tr-line); border-top-color:var(--tr-green);"
+                        ></div>
                         Lade…
                     </div>
                 {/if}
@@ -1359,20 +1662,40 @@
 
             <!-- Body: trend + table -->
             <div class="flex-1 overflow-auto chat-scroll flex flex-col">
-
                 <!-- Daily trend bars (hidden for Tag view) -->
                 {#if statPeriod !== "day" && dayMap.length > 0}
-                    <div class="px-6 py-4 shrink-0" style="border-bottom:1px solid var(--tr-line);">
-                        <div class="font-mono text-[10px] uppercase font-medium mb-3"
-                             style="letter-spacing:1.2px; color:var(--tr-text-faint);">Verlauf</div>
+                    <div
+                        class="px-6 py-4 shrink-0"
+                        style="border-bottom:1px solid var(--tr-line);"
+                    >
+                        <div
+                            class="font-mono text-[10px] uppercase font-medium mb-3"
+                            style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                        >
+                            Verlauf
+                        </div>
                         <div class="flex items-end gap-1" style="height:52px;">
                             {#each dayMap as [day, count]}
-                                {@const pct = maxDayCount > 0 ? (count / maxDayCount) * 100 : 0}
-                                <div class="flex flex-col items-center gap-1 flex-1 min-w-0" title="{day}: {count}">
-                                    <div class="w-full rounded-t-[2px]"
-                                         style="height:{Math.max(4,pct*0.48)}px; background:var(--tr-green); opacity:0.7;"></div>
+                                {@const pct =
+                                    maxDayCount > 0
+                                        ? (count / maxDayCount) * 100
+                                        : 0}
+                                <div
+                                    class="flex flex-col items-center gap-1 flex-1 min-w-0"
+                                    title="{day}: {count}"
+                                >
+                                    <div
+                                        class="w-full rounded-t-[2px]"
+                                        style="height:{Math.max(
+                                            4,
+                                            pct * 0.48,
+                                        )}px; background:var(--tr-green); opacity:0.7;"
+                                    ></div>
                                     {#if dayMap.length <= 14}
-                                        <div class="font-mono text-[8px]" style="color:var(--tr-text-faint); white-space:nowrap;">
+                                        <div
+                                            class="font-mono text-[8px]"
+                                            style="color:var(--tr-text-faint); white-space:nowrap;"
+                                        >
                                             {day.slice(5)}
                                         </div>
                                     {/if}
@@ -1384,18 +1707,44 @@
 
                 <!-- Top ramps (hidden for Tag view) -->
                 {#if statPeriod !== "day" && topRamps.length > 0}
-                    <div class="px-6 py-4 shrink-0" style="border-bottom:1px solid var(--tr-line);">
-                        <div class="font-mono text-[10px] uppercase font-medium mb-3"
-                             style="letter-spacing:1.2px; color:var(--tr-text-faint);">Aktivität pro Rampe (Top 5)</div>
+                    <div
+                        class="px-6 py-4 shrink-0"
+                        style="border-bottom:1px solid var(--tr-line);"
+                    >
+                        <div
+                            class="font-mono text-[10px] uppercase font-medium mb-3"
+                            style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                        >
+                            Aktivität pro Rampe (Top 5)
+                        </div>
                         <div class="flex flex-col gap-2">
                             {#each topRamps as [id, count]}
-                                {@const pct = stats.byRamp.size > 0 ? (count / (topRamps[0][1] || 1)) * 100 : 0}
+                                {@const pct =
+                                    stats.byRamp.size > 0
+                                        ? (count / (topRamps[0][1] || 1)) * 100
+                                        : 0}
                                 <div class="flex items-center gap-3">
-                                    <div class="font-mono text-[12px] font-semibold w-14 shrink-0" style="color:var(--tr-text);">Rampe {id}</div>
-                                    <div class="flex-1 rounded-full overflow-hidden" style="height:6px; background:var(--tr-line);">
-                                        <div class="h-full rounded-full" style="width:{pct}%; background:var(--tr-green);"></div>
+                                    <div
+                                        class="font-mono text-[12px] font-semibold w-14 shrink-0"
+                                        style="color:var(--tr-text);"
+                                    >
+                                        Rampe {id}
                                     </div>
-                                    <div class="font-mono text-[11px] w-8 text-right" style="color:var(--tr-text-dim);">{count}</div>
+                                    <div
+                                        class="flex-1 rounded-full overflow-hidden"
+                                        style="height:6px; background:var(--tr-line);"
+                                    >
+                                        <div
+                                            class="h-full rounded-full"
+                                            style="width:{pct}%; background:var(--tr-green);"
+                                        ></div>
+                                    </div>
+                                    <div
+                                        class="font-mono text-[11px] w-8 text-right"
+                                        style="color:var(--tr-text-dim);"
+                                    >
+                                        {count}
+                                    </div>
                                 </div>
                             {/each}
                         </div>
@@ -1404,51 +1753,128 @@
 
                 <!-- Event table (always shown) -->
                 {#if dayEntries.length === 0}
-                    <div class="flex flex-col items-center justify-center py-16 gap-3" style="color:var(--tr-text-faint);">
-                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                        <p class="text-sm font-medium">Keine Ereignisse im gewählten Zeitraum</p>
+                    <div
+                        class="flex flex-col items-center justify-center py-16 gap-3"
+                        style="color:var(--tr-text-faint);"
+                    >
+                        <svg
+                            width="28"
+                            height="28"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                            ><path
+                                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                            /><polyline points="14 2 14 8 20 8" /></svg
+                        >
+                        <p class="text-sm font-medium">
+                            Keine Ereignisse im gewählten Zeitraum
+                        </p>
                     </div>
                 {:else}
                     <table class="w-full text-left border-collapse">
                         <thead>
-                            <tr style="position:sticky; top:0; background:var(--tr-surface2); border-bottom:1px solid var(--tr-line);">
-                                {#each (statPeriod==="day"?["Zeit","Rampe","Vorher → Nachher","Dauer","Fahrer","Kennzeichen"]:["Datum","Zeit","Rampe","Vorher → Nachher","Dauer","Fahrer","Kennzeichen"]) as col}
-                                    <th class="font-mono text-[10px] font-semibold uppercase px-4 py-2.5"
-                                        style="letter-spacing:1px; color:var(--tr-text-faint); white-space:nowrap;">{col}</th>
+                            <tr
+                                style="position:sticky; top:0; background:var(--tr-surface2); border-bottom:1px solid var(--tr-line);"
+                            >
+                                {#each statPeriod === "day" ? ["Zeit", "Rampe", "Vorher → Nachher", "Dauer", "Mitarbeiter", "Kennzeichen"] : ["Datum", "Zeit", "Rampe", "Vorher → Nachher", "Dauer", "Mitarbeiter", "Kennzeichen"] as col}
+                                    <th
+                                        class="font-mono text-[10px] font-semibold uppercase px-4 py-2.5"
+                                        style="letter-spacing:1px; color:var(--tr-text-faint); white-space:nowrap;"
+                                        >{col}</th
+                                    >
                                 {/each}
                             </tr>
                         </thead>
                         <tbody>
                             {#each dayEntries as ev, i}
                                 {@const tone = getStatusTone(ev.to_status)}
-                                <tr style="border-bottom:1px solid var(--tr-line); background:{i%2===0?'transparent':'rgba(0,0,0,0.025)'};">
+                                <tr
+                                    style="border-bottom:1px solid var(--tr-line); background:{i %
+                                        2 ===
+                                    0
+                                        ? 'transparent'
+                                        : 'rgba(0,0,0,0.025)'};"
+                                >
                                     {#if statPeriod !== "day"}
-                                        <td class="px-4 py-2 font-mono text-[11px]" style="color:var(--tr-text-dim); white-space:nowrap;">
-                                            {ev.timestamp.slice(0,10)}
+                                        <td
+                                            class="px-4 py-2 font-mono text-[11px]"
+                                            style="color:var(--tr-text-dim); white-space:nowrap;"
+                                        >
+                                            {ev.timestamp.slice(0, 10)}
                                         </td>
                                     {/if}
-                                    <td class="px-4 py-2 font-mono text-[11px]" style="color:var(--tr-text-dim); white-space:nowrap;">
-                                        {new Date(ev.timestamp).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
+                                    <td
+                                        class="px-4 py-2 font-mono text-[11px]"
+                                        style="color:var(--tr-text-dim); white-space:nowrap;"
+                                    >
+                                        {new Date(
+                                            ev.timestamp,
+                                        ).toLocaleTimeString("de-DE", {
+                                            hour: "2-digit",
+                                            minute: "2-digit",
+                                            second: "2-digit",
+                                        })}
                                     </td>
                                     <td class="px-4 py-2">
-                                        <span class="font-mono text-[14px] font-semibold" style="color:var(--tr-text);">{ev.ramp_id}</span>
+                                        <span
+                                            class="font-mono text-[14px] font-semibold"
+                                            style="color:var(--tr-text);"
+                                            >{ev.ramp_id}</span
+                                        >
                                     </td>
                                     <td class="px-4 py-2">
                                         <div class="flex items-center gap-1.5">
-                                            <span class="font-mono px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase"
-                                                  style="background:{getStatusTone(ev.from_status).bg}; color:{getStatusTone(ev.from_status).fg}; border:1px solid {getStatusTone(ev.from_status).line};">
+                                            <span
+                                                class="font-mono px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase"
+                                                style="background:{getStatusTone(
+                                                    ev.from_status,
+                                                ).bg}; color:{getStatusTone(
+                                                    ev.from_status,
+                                                )
+                                                    .fg}; border:1px solid {getStatusTone(
+                                                    ev.from_status,
+                                                ).line};"
+                                            >
                                                 {fmtStatusDE(ev.from_status)}
                                             </span>
-                                            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color:var(--tr-text-faint);"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
-                                            <span class="font-mono px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase"
-                                                  style="background:{tone.bg}; color:{tone.fg}; border:1px solid {tone.line};">
+                                            <svg
+                                                width="9"
+                                                height="9"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                stroke-width="2.5"
+                                                style="color:var(--tr-text-faint);"
+                                                ><path
+                                                    d="M5 12h14M12 5l7 7-7 7"
+                                                /></svg
+                                            >
+                                            <span
+                                                class="font-mono px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase"
+                                                style="background:{tone.bg}; color:{tone.fg}; border:1px solid {tone.line};"
+                                            >
                                                 {fmtStatusDE(ev.to_status)}
                                             </span>
                                         </div>
                                     </td>
-                                    <td class="px-4 py-2 font-mono text-[11px]" style="color:var(--tr-text-dim);">{fmtDuration(ev.duration_min)}</td>
-                                    <td class="px-4 py-2 text-[11px]" style="color:var(--tr-text-dim);">{ev.user}</td>
-                                    <td class="px-4 py-2 font-mono text-[11px]" style="color:{ev.kennzeichen?'var(--tr-text)':'var(--tr-text-faint)'};">
+                                    <td
+                                        class="px-4 py-2 font-mono text-[11px]"
+                                        style="color:var(--tr-text-dim);"
+                                        >{fmtDuration(ev.duration_min)}</td
+                                    >
+                                    <td
+                                        class="px-4 py-2 text-[11px]"
+                                        style="color:var(--tr-text-dim);"
+                                        >{ev.user}</td
+                                    >
+                                    <td
+                                        class="px-4 py-2 font-mono text-[11px]"
+                                        style="color:{ev.kennzeichen
+                                            ? 'var(--tr-text)'
+                                            : 'var(--tr-text-faint)'};"
+                                    >
                                         {ev.kennzeichen || "—"}
                                     </td>
                                 </tr>
@@ -1456,6 +1882,165 @@
                         </tbody>
                     </table>
                 {/if}
+            </div>
+        </div>
+    </div>
+{/if}
+
+<!-- ── Benutzerverwaltung Modal ── -->
+{#if showUserMgmt}
+    <div
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
+        onclick={(e) => {
+            if (e.target === e.currentTarget) showUserMgmt = false;
+        }}
+        onkeydown={(e) => {
+            if (e.key === "Escape") showUserMgmt = false;
+        }}
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-label="Benutzerverwaltung"
+    >
+        <div
+            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+            style="width: 520px; max-width: 96vw; max-height: 80vh; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+        >
+            <!-- Header -->
+            <div
+                class="flex items-center gap-4 px-6 py-4 shrink-0"
+                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
+            >
+                <div class="flex-1">
+                    <div class="text-[15px] font-semibold" style="color:#fff;">
+                        Benutzerverwaltung
+                    </div>
+                    <div
+                        class="font-mono text-[10.5px] uppercase mt-[3px]"
+                        style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);"
+                    >
+                        {allUsers.length} Benutzer registriert
+                    </div>
+                </div>
+                <button
+                    onclick={() => (showUserMgmt = false)}
+                    aria-label="Schließen"
+                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                    style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);"
+                >
+                    <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg
+                    >
+                </button>
+            </div>
+
+            <!-- User list -->
+            <div class="flex-1 overflow-auto chat-scroll p-4">
+                {#if userMgmtLoading}
+                    <div
+                        class="flex items-center justify-center py-12 gap-3"
+                        style="color:var(--tr-text-faint);"
+                    >
+                        <div
+                            class="w-5 h-5 rounded-full animate-spin"
+                            style="border:2px solid var(--tr-line); border-top-color:var(--tr-green);"
+                        ></div>
+                        Lade…
+                    </div>
+                {:else if allUsers.length === 0}
+                    <p
+                        class="text-center py-12 text-sm"
+                        style="color:var(--tr-text-faint);"
+                    >
+                        Keine Benutzer gefunden.
+                    </p>
+                {:else}
+                    <table class="w-full border-collapse">
+                        <thead>
+                            <tr style="border-bottom:1px solid var(--tr-line);">
+                                <th
+                                    class="text-left font-mono text-[10px] uppercase pb-2.5 px-2"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                    >Benutzer</th
+                                >
+                                <th
+                                    class="text-left font-mono text-[10px] uppercase pb-2.5 px-2"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                    >Rolle</th
+                                >
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#each allUsers as u (u.username)}
+                                <tr
+                                    style="border-bottom:1px solid var(--tr-line);"
+                                >
+                                    <td class="py-2.5 px-2">
+                                        <div class="flex items-center gap-2">
+                                            <div
+                                                class="w-6 h-6 rounded-full grid place-items-center text-[10px] font-semibold shrink-0"
+                                                style="background:var(--tr-red); color:#fff;"
+                                            >
+                                                {u.username
+                                                    .charAt(0)
+                                                    .toUpperCase()}
+                                            </div>
+                                            <span
+                                                class="text-[13px]"
+                                                style="color:var(--tr-text);"
+                                                >{u.username}</span
+                                            >
+                                            {#if u.username === currentUser}
+                                                <span
+                                                    class="font-mono text-[9px] px-1.5 py-0.5 rounded"
+                                                    style="background:var(--tr-surface2); color:var(--tr-text-faint); border:1px solid var(--tr-line);"
+                                                    >Ich</span
+                                                >
+                                            {/if}
+                                        </div>
+                                    </td>
+                                    <td class="py-2.5 px-2">
+                                        <select
+                                            value={u.role}
+                                            onchange={(e) =>
+                                                changeUserRole(
+                                                    u.username,
+                                                    e.currentTarget.value,
+                                                )}
+                                            class="rounded-[6px] px-2 py-1.5 text-[12px] outline-none cursor-pointer"
+                                            style="background:var(--tr-surface2); border:1px solid var(--tr-line); color:var(--tr-text);"
+                                        >
+                                            <option value="member_lager"
+                                                >Lager (Standard)</option
+                                            >
+                                            <option value="member_buero"
+                                                >Büro</option
+                                            >
+                                            <option value="admin"
+                                                >Administrator</option
+                                            >
+                                        </select>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+            </div>
+
+            <!-- Footer -->
+            <div
+                class="shrink-0 px-4 py-3 text-[11px]"
+                style="border-top:1px solid var(--tr-line); color:var(--tr-text-faint); background:var(--tr-surface2);"
+            >
+                Neue Benutzer erhalten automatisch die Rolle "Lager" wenn sie
+                die App zum ersten Mal öffnen.
             </div>
         </div>
     </div>
