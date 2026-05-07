@@ -83,6 +83,7 @@
             if (e.ctrlKey && e.key.toLowerCase() === "b") {
                 e.preventDefault();
                 isBuero = !isBuero;
+                if (!isBuero) showProtocol = false;
             }
         };
         window.addEventListener("keydown", bueroKeyHandler);
@@ -545,7 +546,8 @@
             style="background: rgba(255,255,255,0.1);"
         ></div>
 
-        <!-- Protokoll button -->
+        <!-- Protokoll button — Büromodus only -->
+        {#if isBuero}
         <button
             onclick={openProtocol}
             class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
@@ -558,6 +560,7 @@
                 <span class="font-mono text-[10px]" style="color: rgba(255,255,255,0.45);">{dailyLog.length}</span>
             {/if}
         </button>
+        {/if}
 
         <!-- Büroversion badge -->
         {#if isBuero}
