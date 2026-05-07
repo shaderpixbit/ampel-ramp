@@ -19,6 +19,10 @@ struct Ramp {
     // Unix ms timestamp until which this ramp is locked for all clients
     #[serde(default)]
     locked_until: Option<i64>,
+    #[serde(default)]
+    kennzeichen: Option<String>,
+    #[serde(default)]
+    notiz: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -60,6 +64,8 @@ fn initialize_state() -> Vec<Ramp> {
             last_updated_by: "System".to_string(),
             last_updated_at: Some(now.clone()),
             locked_until: None,
+            kennzeichen: None,
+            notiz: None,
         });
     }
     ramps

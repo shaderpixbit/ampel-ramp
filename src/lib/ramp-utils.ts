@@ -7,6 +7,8 @@ export interface Ramp {
   last_updated_by: string;
   last_updated_at: string | null;
   locked_until: number | null;
+  kennzeichen: string | null;
+  notiz: string | null;
 }
 
 export const NEXT_STATUS: Record<RampStatus, RampStatus> = {
