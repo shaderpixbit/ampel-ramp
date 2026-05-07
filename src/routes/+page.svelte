@@ -358,8 +358,10 @@
         }
     }
 
-    function openProtocol() {
-        fetchDailyLog();
+    async function openProtocol() {
+        statPeriod = "day";
+        await fetchDailyLog();
+        periodEvents = dailyLog;
         showProtocol = true;
     }
 
@@ -376,6 +378,70 @@
         const m = min % 60;
         return `${h}h ${String(m).padStart(2, "0")}m`;
     }
+
+    // ── Statistics ──
+    type StatPeriod = "day" | "week" | "month" | "year";
+    let statPeriod = $state<StatPeriod>("day");
+    let periodEvents = $state<RampEvent[]>([]);
+    let periodLoading = $state(false);
+
+    function getPeriodDates(period: StatPeriod): { from: string; to: string } {
+        const today = new Date();
+        const to = today.toISOString().slice(0, 10);
+        if (period === "week") {
+            const from = new Date(today.getTime() - 6 * 86_400_000);
+            return { from: from.toISOString().slice(0, 10), to };
+        }
+        if (period === "month") {
+            const from = new Date(today.getFullYear(), today.getMonth(), 1);
+            return { from: from.toISOString().slice(0, 10), to };
+        }
+        if (period === "year") {
+            const from = new Date(today.getFullYear(), 0, 1);
+            return { from: from.toISOString().slice(0, 10), to };
+        }
+        return { from: to, to }; // day
+    }
+
+    async function fetchPeriodEvents(period: StatPeriod) {
+        if (period === "day") { periodEvents = dailyLog; return; }
+        periodLoading = true;
+        try {
+            const { from, to } = getPeriodDates(period);
+            periodEvents = await invoke<RampEvent[]>("get_events_for_period", {
+                fromDate: from,
+                toDate: to,
+            });
+        } catch (e) {
+            console.error("Failed to fetch period events:", e);
+        } finally {
+            periodLoading = false;
+        }
+    }
+
+    async function selectPeriod(p: StatPeriod) {
+        statPeriod = p;
+        await fetchPeriodEvents(p);
+    }
+
+    function computeStats(events: RampEvent[]) {
+        const completions = events.filter((e) => e.to_status === "free").length;
+        const dwellEvts = events.filter((e) => e.duration_min !== null && e.from_status !== "free");
+        const avgDwell = dwellEvts.length
+            ? Math.round(dwellEvts.reduce((s, e) => s + (e.duration_min ?? 0), 0) / dwellEvts.length)
+            : null;
+        const byDay = new Map<string, number>();
+        const byRamp = new Map<number, number>();
+        for (const e of events) {
+            const d = e.timestamp.slice(0, 10);
+            byDay.set(d, (byDay.get(d) ?? 0) + 1);
+            byRamp.set(e.ramp_id, (byRamp.get(e.ramp_id) ?? 0) + 1);
+        }
+        const topRampEntry = [...byRamp.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
+        return { totalEvents: events.length, completions, avgDwell, byDay, byRamp, topRampEntry };
+    }
+
+    let periodStats = $derived(computeStats(periodEvents));
 
     function focusInput(node: HTMLInputElement) {
         node.focus();
@@ -673,7 +739,9 @@
                     tabindex="0"
                     aria-label="Rampe {ramp.id}, {getStatusLabel(ramp.status)}. Enter um Status zu ändern."
                     onclick={(e) => {
-                        if ((e.target as HTMLElement).closest("[data-field]")) return;
+                        // Only block clicks that land directly on an active input
+                        // Field buttons handle their own stopPropagation
+                        if ((e.target as HTMLElement).tagName === "INPUT") return;
                         if (canEdit) cycleStatus(ramp);
                     }}
                     onkeydown={(e) => {
@@ -1212,101 +1280,171 @@
     </div>
 </div>
 
-<!-- ── Tagesprotokoll Modal ── -->
+<!-- ── Protokoll & Statistik Modal ── -->
 {#if showProtocol}
+    {@const stats = periodStats}
+    {@const dayEntries = [...periodEvents].reverse()}
+    {@const dayMap = [...stats.byDay.entries()].sort((a,b) => a[0].localeCompare(b[0]))}
+    {@const maxDayCount = dayMap.length ? Math.max(...dayMap.map(([,n]) => n)) : 1}
+    {@const topRamps = [...stats.byRamp.entries()].sort((a,b) => b[1]-a[1]).slice(0,5)}
     <div
         class="fixed inset-0 z-50 flex items-center justify-center"
         style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
         onclick={(e) => { if (e.target === e.currentTarget) showProtocol = false; }}
         onkeydown={(e) => { if (e.key === "Escape") showProtocol = false; }}
-        role="dialog"
-        tabindex="-1"
-        aria-modal="true"
-        aria-label="Tagesprotokoll"
+        role="dialog" tabindex="-1" aria-modal="true" aria-label="Protokoll & Statistik"
     >
-        <div
-            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
-            style="width: 1100px; max-width: 95vw; max-height: 85vh; background: var(--tr-surface); border: 1px solid var(--tr-line);"
-        >
-            <!-- Modal header -->
-            <div
-                class="flex items-center gap-4 px-6 py-4 shrink-0"
-                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
-            >
+        <div class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+             style="width: 1140px; max-width: 96vw; max-height: 88vh; background: var(--tr-surface); border: 1px solid var(--tr-line);">
+
+            <!-- Header -->
+            <div class="flex items-center gap-4 px-6 py-4 shrink-0"
+                 style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);">
                 <div class="flex-1">
-                    <div class="text-[15px] font-semibold" style="color: #fff;">Tagesprotokoll</div>
+                    <div class="text-[15px] font-semibold" style="color:#fff;">Protokoll & Statistik</div>
                     <div class="font-mono text-[10.5px] uppercase mt-[3px]"
-                         style="letter-spacing: 1.4px; color: rgba(255,255,255,0.45);">
-                        {new Date().toLocaleDateString("de-DE", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })}
-                        &nbsp;·&nbsp; {dailyLog.length} Ereignisse
+                         style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);">
+                        {new Date().toLocaleDateString("de-DE",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"})}
+                        &nbsp;·&nbsp; {stats.totalEvents} Ereignisse
                     </div>
                 </div>
-                <button
-                    onclick={() => window.print()}
-                    class="h-8 px-4 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
-                    style="border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.8);"
-                    aria-label="Drucken"
-                >
+                <!-- Period tabs -->
+                <div class="flex gap-1" style="background:rgba(255,255,255,0.06); padding:3px; border-radius:8px;">
+                    {#each ([["day","Tag"],["week","Woche"],["month","Monat"],["year","Jahr"]] as const) as [p, label]}
+                        <button onclick={() => selectPeriod(p)}
+                                class="px-3 py-1 rounded-[6px] font-mono text-[11px] font-semibold uppercase cursor-pointer transition-colors"
+                                style="letter-spacing:0.8px; background:{statPeriod===p?'rgba(255,255,255,0.12)':'transparent'}; color:{statPeriod===p?'#fff':'rgba(255,255,255,0.5)'}; border:none;">
+                            {label}
+                        </button>
+                    {/each}
+                </div>
+                <button onclick={() => window.print()} aria-label="Drucken"
+                        class="h-8 px-3 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
+                        style="border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.8);">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
                     Drucken
                 </button>
-                <button
-                    onclick={() => (showProtocol = false)}
-                    aria-label="Schließen"
-                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
-                    style="border: 1px solid rgba(255,255,255,0.1); background: transparent; color: rgba(255,255,255,0.6);"
-                >
+                <button onclick={() => (showProtocol = false)} aria-label="Schließen"
+                        class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                        style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
                 </button>
             </div>
 
-            <!-- Table -->
-            <div class="flex-1 overflow-auto chat-scroll">
-                {#if dailyLog.length === 0}
-                    <div class="flex flex-col items-center justify-center py-20 gap-3"
-                         style="color: var(--tr-text-faint);">
-                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                        <p class="text-sm font-medium">Noch keine Ereignisse heute</p>
+            <!-- Summary strip -->
+            <div class="flex gap-6 px-6 py-3 shrink-0"
+                 style="border-bottom:1px solid var(--tr-line); background:var(--tr-surface2);">
+                {#each [
+                    {label:"Statuswechsel", value:String(stats.totalEvents), color:"var(--tr-text)"},
+                    {label:"Abfertigungen",  value:String(stats.completions),  color:"var(--tr-green)"},
+                    {label:"Ø Verweildauer", value:stats.avgDwell!==null?fmtDuration(stats.avgDwell):"—", color:"var(--tr-warning)"},
+                    {label:"Aktivste Rampe", value:stats.topRampEntry?`Rampe ${stats.topRampEntry[0]} (${stats.topRampEntry[1]}×)`:"—", color:"var(--tr-text)"},
+                ] as s}
+                    <div class="flex flex-col gap-0.5">
+                        <div class="font-mono text-[10px] uppercase font-medium" style="letter-spacing:1px; color:var(--tr-text-faint);">{s.label}</div>
+                        <div class="font-mono text-[16px] font-semibold leading-none" style="color:{s.color};">{s.value}</div>
+                    </div>
+                {/each}
+                {#if periodLoading}
+                    <div class="flex items-center gap-2 ml-auto text-[12px]" style="color:var(--tr-text-faint);">
+                        <div class="w-4 h-4 rounded-full animate-spin" style="border:2px solid var(--tr-line); border-top-color:var(--tr-green);"></div>
+                        Lade…
+                    </div>
+                {/if}
+            </div>
+
+            <!-- Body: trend + table -->
+            <div class="flex-1 overflow-auto chat-scroll flex flex-col">
+
+                <!-- Daily trend bars (hidden for Tag view) -->
+                {#if statPeriod !== "day" && dayMap.length > 0}
+                    <div class="px-6 py-4 shrink-0" style="border-bottom:1px solid var(--tr-line);">
+                        <div class="font-mono text-[10px] uppercase font-medium mb-3"
+                             style="letter-spacing:1.2px; color:var(--tr-text-faint);">Verlauf</div>
+                        <div class="flex items-end gap-1" style="height:52px;">
+                            {#each dayMap as [day, count]}
+                                {@const pct = maxDayCount > 0 ? (count / maxDayCount) * 100 : 0}
+                                <div class="flex flex-col items-center gap-1 flex-1 min-w-0" title="{day}: {count}">
+                                    <div class="w-full rounded-t-[2px]"
+                                         style="height:{Math.max(4,pct*0.48)}px; background:var(--tr-green); opacity:0.7;"></div>
+                                    {#if dayMap.length <= 14}
+                                        <div class="font-mono text-[8px]" style="color:var(--tr-text-faint); white-space:nowrap;">
+                                            {day.slice(5)}
+                                        </div>
+                                    {/if}
+                                </div>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+
+                <!-- Top ramps (hidden for Tag view) -->
+                {#if statPeriod !== "day" && topRamps.length > 0}
+                    <div class="px-6 py-4 shrink-0" style="border-bottom:1px solid var(--tr-line);">
+                        <div class="font-mono text-[10px] uppercase font-medium mb-3"
+                             style="letter-spacing:1.2px; color:var(--tr-text-faint);">Aktivität pro Rampe (Top 5)</div>
+                        <div class="flex flex-col gap-2">
+                            {#each topRamps as [id, count]}
+                                {@const pct = stats.byRamp.size > 0 ? (count / (topRamps[0][1] || 1)) * 100 : 0}
+                                <div class="flex items-center gap-3">
+                                    <div class="font-mono text-[12px] font-semibold w-14 shrink-0" style="color:var(--tr-text);">Rampe {id}</div>
+                                    <div class="flex-1 rounded-full overflow-hidden" style="height:6px; background:var(--tr-line);">
+                                        <div class="h-full rounded-full" style="width:{pct}%; background:var(--tr-green);"></div>
+                                    </div>
+                                    <div class="font-mono text-[11px] w-8 text-right" style="color:var(--tr-text-dim);">{count}</div>
+                                </div>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+
+                <!-- Event table (always shown) -->
+                {#if dayEntries.length === 0}
+                    <div class="flex flex-col items-center justify-center py-16 gap-3" style="color:var(--tr-text-faint);">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        <p class="text-sm font-medium">Keine Ereignisse im gewählten Zeitraum</p>
                     </div>
                 {:else}
                     <table class="w-full text-left border-collapse">
                         <thead>
-                            <tr style="position: sticky; top: 0; background: var(--tr-surface2); border-bottom: 1px solid var(--tr-line);">
-                                {#each ["Zeit", "Rampe", "Vorher → Nachher", "Dauer", "Fahrer", "Kennzeichen"] as col}
-                                    <th class="font-mono text-[10px] font-semibold uppercase px-4 py-3"
-                                        style="letter-spacing: 1px; color: var(--tr-text-faint); white-space: nowrap;">{col}</th>
+                            <tr style="position:sticky; top:0; background:var(--tr-surface2); border-bottom:1px solid var(--tr-line);">
+                                {#each (statPeriod==="day"?["Zeit","Rampe","Vorher → Nachher","Dauer","Fahrer","Kennzeichen"]:["Datum","Zeit","Rampe","Vorher → Nachher","Dauer","Fahrer","Kennzeichen"]) as col}
+                                    <th class="font-mono text-[10px] font-semibold uppercase px-4 py-2.5"
+                                        style="letter-spacing:1px; color:var(--tr-text-faint); white-space:nowrap;">{col}</th>
                                 {/each}
                             </tr>
                         </thead>
                         <tbody>
-                            {#each [...dailyLog].reverse() as ev, i}
+                            {#each dayEntries as ev, i}
                                 {@const tone = getStatusTone(ev.to_status)}
-                                <tr style="border-bottom: 1px solid var(--tr-line); background: {i % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.03)'};">
-                                    <td class="px-4 py-2.5 font-mono text-[12px]" style="color: var(--tr-text-dim); white-space: nowrap;">
-                                        {new Date(ev.timestamp).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                                <tr style="border-bottom:1px solid var(--tr-line); background:{i%2===0?'transparent':'rgba(0,0,0,0.025)'};">
+                                    {#if statPeriod !== "day"}
+                                        <td class="px-4 py-2 font-mono text-[11px]" style="color:var(--tr-text-dim); white-space:nowrap;">
+                                            {ev.timestamp.slice(0,10)}
+                                        </td>
+                                    {/if}
+                                    <td class="px-4 py-2 font-mono text-[11px]" style="color:var(--tr-text-dim); white-space:nowrap;">
+                                        {new Date(ev.timestamp).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
                                     </td>
-                                    <td class="px-4 py-2.5">
-                                        <span class="font-mono text-[15px] font-semibold" style="color: var(--tr-text);">{ev.ramp_id}</span>
+                                    <td class="px-4 py-2">
+                                        <span class="font-mono text-[14px] font-semibold" style="color:var(--tr-text);">{ev.ramp_id}</span>
                                     </td>
-                                    <td class="px-4 py-2.5">
-                                        <div class="flex items-center gap-2 text-[12px]">
-                                            <span class="font-mono px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase"
-                                                  style="background: {getStatusTone(ev.from_status).bg}; color: {getStatusTone(ev.from_status).fg}; border: 1px solid {getStatusTone(ev.from_status).line};">
+                                    <td class="px-4 py-2">
+                                        <div class="flex items-center gap-1.5">
+                                            <span class="font-mono px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase"
+                                                  style="background:{getStatusTone(ev.from_status).bg}; color:{getStatusTone(ev.from_status).fg}; border:1px solid {getStatusTone(ev.from_status).line};">
                                                 {fmtStatusDE(ev.from_status)}
                                             </span>
-                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color: var(--tr-text-faint);"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
-                                            <span class="font-mono px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase"
-                                                  style="background: {tone.bg}; color: {tone.fg}; border: 1px solid {tone.line};">
+                                            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color:var(--tr-text-faint);"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                                            <span class="font-mono px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase"
+                                                  style="background:{tone.bg}; color:{tone.fg}; border:1px solid {tone.line};">
                                                 {fmtStatusDE(ev.to_status)}
                                             </span>
                                         </div>
                                     </td>
-                                    <td class="px-4 py-2.5 font-mono text-[12px]" style="color: var(--tr-text-dim);">
-                                        {fmtDuration(ev.duration_min)}
-                                    </td>
-                                    <td class="px-4 py-2.5 text-[12px]" style="color: var(--tr-text-dim);">{ev.user}</td>
-                                    <td class="px-4 py-2.5 font-mono text-[12px]"
-                                        style="color: {ev.kennzeichen ? 'var(--tr-text)' : 'var(--tr-text-faint)'};">
+                                    <td class="px-4 py-2 font-mono text-[11px]" style="color:var(--tr-text-dim);">{fmtDuration(ev.duration_min)}</td>
+                                    <td class="px-4 py-2 text-[11px]" style="color:var(--tr-text-dim);">{ev.user}</td>
+                                    <td class="px-4 py-2 font-mono text-[11px]" style="color:{ev.kennzeichen?'var(--tr-text)':'var(--tr-text-faint)'};">
                                         {ev.kennzeichen || "—"}
                                     </td>
                                 </tr>
@@ -1315,29 +1453,6 @@
                     </table>
                 {/if}
             </div>
-
-            <!-- Summary footer -->
-            {#if dailyLog.length > 0}
-                <div class="flex items-center gap-8 px-6 py-3 shrink-0"
-                     style="border-top: 1px solid var(--tr-line); background: var(--tr-surface2);">
-                    <div class="flex items-baseline gap-2">
-                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Statuswechsel</span>
-                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-text);">{dailyLog.length}</span>
-                    </div>
-                    <div class="flex items-baseline gap-2">
-                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Ø Verweildauer</span>
-                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-warning);">
-                            {avgDwellToday !== null ? fmtDuration(avgDwellToday) : "—"}
-                        </span>
-                    </div>
-                    <div class="flex items-baseline gap-2">
-                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Abfertigungen</span>
-                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-green);">
-                            {dailyLog.filter((e) => e.to_status === "free").length}
-                        </span>
-                    </div>
-                </div>
-            {/if}
         </div>
     </div>
 {/if}

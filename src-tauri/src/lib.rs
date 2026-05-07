@@ -1,4 +1,4 @@
-use chrono::{Local, TimeZone};
+use chrono::{Datelike, Local, TimeZone};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -8,7 +8,7 @@ use tauri::command;
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
 const MAX_CHAT_MESSAGES: usize = 100;
-const MAX_LOG_EVENTS: usize = 500;
+const MAX_LOG_EVENTS_PER_MONTH: usize = 5000;
 
 const SECTION_A: &[u32] = &[42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30];
 const SECTION_B: &[u32] = &[57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43];
@@ -62,13 +62,18 @@ fn get_db_path() -> PathBuf {
     path
 }
 
-fn get_log_path() -> PathBuf {
+fn get_log_path_for_month(year: i32, month: u32) -> PathBuf {
     let mut path = std::env::current_exe()
         .or_else(|_| std::env::current_dir())
         .expect("Cannot determine path");
     path.pop();
-    path.push("ramp_events.json");
+    path.push(format!("ramp_events_{:04}-{:02}.json", year, month));
     path
+}
+
+fn get_current_log_path() -> PathBuf {
+    let now = Local::now();
+    get_log_path_for_month(now.year(), now.month())
 }
 
 fn get_chat_path() -> PathBuf {
@@ -93,14 +98,14 @@ fn parse_ts_millis(s: &str) -> Option<i64> {
 }
 
 fn append_event(event: RampEvent) {
-    let path = get_log_path();
+    let path = get_current_log_path();
     let Ok(mut file) = open_state_file(&path) else { return };
     let mut contents = String::new();
     let _ = file.read_to_string(&mut contents);
     let mut events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
     events.push(event);
-    if events.len() > MAX_LOG_EVENTS {
-        let drain = events.len() - MAX_LOG_EVENTS;
+    if events.len() > MAX_LOG_EVENTS_PER_MONTH {
+        let drain = events.len() - MAX_LOG_EVENTS_PER_MONTH;
         events.drain(0..drain);
     }
     if let Ok(json) = serde_json::to_string_pretty(&events) {
@@ -301,7 +306,7 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
 
 #[command]
 fn get_daily_log() -> Result<Vec<RampEvent>, String> {
-    let path = get_log_path();
+    let path = get_current_log_path();
     if !path.exists() {
         return Ok(vec![]);
     }
@@ -313,6 +318,43 @@ fn get_daily_log() -> Result<Vec<RampEvent>, String> {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
     Ok(events.into_iter().filter(|e| e.timestamp.starts_with(&today)).collect())
+}
+
+/// Returns all events between from_date and to_date (inclusive, "YYYY-MM-DD").
+/// Reads every monthly log file that overlaps the requested range.
+#[command]
+fn get_events_for_period(from_date: String, to_date: String) -> Result<Vec<RampEvent>, String> {
+    let from = chrono::NaiveDate::parse_from_str(&from_date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid from_date: {}", e))?;
+    let to = chrono::NaiveDate::parse_from_str(&to_date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid to_date: {}", e))?;
+
+    let to_str = format!("{}T23:59:59", to_date);
+    let mut all: Vec<RampEvent> = Vec::new();
+
+    // Walk month-by-month across the range
+    let mut year = from.year();
+    let mut month = from.month();
+    loop {
+        let path = get_log_path_for_month(year, month);
+        if path.exists() {
+            if let Ok(mut file) = open_state_file(&path) {
+                let mut contents = String::new();
+                let _ = file.read_to_string(&mut contents);
+                let _ = file.unlock();
+                let events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
+                all.extend(events.into_iter().filter(|e| {
+                    e.timestamp.as_str() >= from_date.as_str()
+                        && e.timestamp.as_str() <= to_str.as_str()
+                }));
+            }
+        }
+        if year == to.year() && month == to.month() { break; }
+        if month == 12 { year += 1; month = 1; } else { month += 1; }
+    }
+
+    all.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(all)
 }
 
 #[command]
@@ -391,7 +433,8 @@ pub fn run() {
             update_ramp,
             get_messages,
             send_message,
-            get_daily_log
+            get_daily_log,
+            get_events_for_period
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
