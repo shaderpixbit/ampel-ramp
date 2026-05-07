@@ -748,6 +748,7 @@
                         if (canEdit) cycleStatus(ramp);
                     }}
                     onkeydown={(e) => {
+                        if ((e.target as HTMLElement).tagName === "INPUT") return;
                         if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
                             if (canEdit) cycleStatus(ramp);
@@ -839,7 +840,7 @@
                             >
                                 <span
                                     class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
-                                    style="letter-spacing:1px; color:var(--tr-text-faint);">KFZ</span
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);">LKW</span
                                 >
                                 <span
                                     class="font-mono text-[11px] font-medium truncate"

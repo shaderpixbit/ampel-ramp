@@ -71,14 +71,17 @@ fn get_db_path() -> PathBuf {
 }
 
 /// Opens the SQLite database, applies PRAGMAs, and creates the schema.
-/// WAL mode + busy_timeout make it safe on SMB network drives with multiple clients.
+/// DELETE journal mode + busy_timeout make it safe on SMB network drives with multiple clients.
+/// WAL mode is intentionally avoided: WAL requires shared-memory locking (-shm file) that SMB
+/// does not implement correctly, causing SQLITE_BUSY / corruption with 10+ concurrent clients.
 pub fn open_db() -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(get_db_path())?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=5000;
-         PRAGMA foreign_keys=ON;",
+        "PRAGMA journal_mode=DELETE;
+         PRAGMA synchronous=FULL;
+         PRAGMA busy_timeout=15000;
+         PRAGMA foreign_keys=ON;
+         PRAGMA temp_store=MEMORY;",
     )?;
     create_schema(&conn)?;
     Ok(conn)
@@ -403,8 +406,12 @@ fn send_message(state: State<DbState>, user: String, text: String) -> Result<Vec
     }
 
     let db = state.0.lock().map_err(|e| e.to_string())?;
-    let id = Local::now().timestamp_millis().to_string();
-    let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = Local::now();
+    // Combine user prefix + nanoseconds to avoid ID collisions when multiple users send at once
+    let user_prefix: String = user.chars().take(6).collect();
+    let ns = now.timestamp_nanos_opt().unwrap_or(now.timestamp_millis() * 1_000_000);
+    let id = format!("{}-{}", user_prefix, ns);
+    let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
 
     db.execute(
         "INSERT INTO chat_messages (id, user, text, timestamp) VALUES (?1,?2,?3,?4)",
