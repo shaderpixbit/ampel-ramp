@@ -223,10 +223,9 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
     let mut file = open_state_file(&path)?;
     let (mut ramps, _) = read_state(&mut file)?;
 
-    let locked_until = Local::now().timestamp_millis() + 2000;
     if let Some(r) = ramps.iter_mut().find(|r| r.id == updated_ramp.id) {
-        // Log whenever the status actually changes
-        if r.status != updated_ramp.status {
+        let status_changed = r.status != updated_ramp.status;
+        if status_changed {
             let duration_min = r.last_updated_at.as_deref()
                 .and_then(parse_ts_millis)
                 .map(|old_ms| (Local::now().timestamp_millis() - old_ms) / 60_000);
@@ -241,7 +240,10 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
             });
         }
         *r = updated_ramp;
-        r.locked_until = Some(locked_until);
+        // Only lock on status changes — field edits (kennzeichen/notiz) need no lock
+        if status_changed {
+            r.locked_until = Some(Local::now().timestamp_millis() + 2000);
+        }
     }
 
     write_state(&mut file, &ramps)?;
