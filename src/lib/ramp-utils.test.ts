@@ -21,6 +21,8 @@ function makeRamp(overrides: Partial<Ramp> = {}): Ramp {
     last_updated_by: "TestUser",
     last_updated_at: null,
     locked_until: null,
+    kennzeichen: null,
+    notiz: null,
     ...overrides,
   };
 }

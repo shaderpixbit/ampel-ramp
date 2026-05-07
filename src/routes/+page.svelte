@@ -6,22 +6,11 @@
         isRampLocked,
         getStatusLabel,
         cycleRampStatus,
-        formatDateTime,
         formatTime,
         formatDate,
         type Ramp,
     } from "$lib/ramp-utils";
-    import { Button } from "$lib/components/ui/button";
-    import {
-        MoonIcon,
-        SunIcon,
-        SendIcon,
-        TruckIcon,
-        CheckIcon,
-        ClockIcon,
-        LockIcon,
-        LoaderCircleIcon,
-    } from "@lucide/svelte";
+    import { LoaderCircleIcon } from "@lucide/svelte";
 
     interface ChatMessage {
         id: string;
@@ -43,6 +32,14 @@
     let chatInput = $state("");
     let isSendingMessage = $state(false);
     let chatScrollEl: HTMLElement;
+    let chatOpen = $state(false);
+    let lastReadCount = $state(0);
+    let unreadCount = $derived(
+        chatOpen ? 0 : Math.max(0, messages.length - lastReadCount),
+    );
+
+    let now = $state(Date.now());
+    let clockInterval: number;
 
     let counts = $derived({
         free: ramps.filter((r) => r.status === "free").length,
@@ -69,19 +66,22 @@
 
         try {
             messages = await invoke("get_messages");
-            await tick();
-            if (chatScrollEl)
-                chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+            lastReadCount = messages.length;
         } catch (e) {
             console.error("Failed to load messages:", e);
         }
 
+        clockInterval = window.setInterval(() => {
+            now = Date.now();
+        }, 1000);
+        await fetchDailyLog();
         syncTimeout = window.setTimeout(startPolling, 1500);
     });
 
     onDestroy(() => {
         clearTimeout(syncTimeout);
         clearTimeout(errorTimeout);
+        clearInterval(clockInterval);
     });
 
     async function startPolling() {
@@ -93,15 +93,17 @@
                     invoke<ChatMessage[]>("get_messages"),
                 ]);
 
-                if (JSON.stringify(ramps) !== JSON.stringify(dbRamps)) {
+                if (JSON.stringify(ramps) !== JSON.stringify(dbRamps))
                     ramps = dbRamps;
-                }
 
                 if (JSON.stringify(messages) !== JSON.stringify(dbMessages)) {
                     messages = dbMessages;
-                    await tick();
-                    if (chatScrollEl)
-                        chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+                    if (chatOpen) {
+                        lastReadCount = messages.length;
+                        await tick();
+                        if (chatScrollEl)
+                            chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+                    }
                 }
 
                 isConnected = true;
@@ -112,7 +114,6 @@
                 isFetching = false;
             }
         }
-
         syncTimeout = window.setTimeout(startPolling, 1500);
     }
 
@@ -124,42 +125,35 @@
         } catch (e) {
             console.error("Failed to fetch state from network drive:", e);
             isConnected = false;
-            showError("Could not load ramp state from network drive.");
+            showError("Verbindung zum Netzlaufwerk fehlgeschlagen.");
         }
     }
 
     async function cycleStatus(ramp: Ramp) {
         if (isUpdating || isRampLocked(ramp)) return;
-
         const newStatus = cycleRampStatus(ramp.status);
-        const now = new Date().toISOString();
-
+        const now_iso = new Date().toISOString();
         const updatedRamp: Ramp = {
             ...ramp,
             status: newStatus,
             last_updated_by: currentUser,
-            last_updated_at: now,
+            last_updated_at: now_iso,
+            ...(newStatus === "free" && { kennzeichen: null, notiz: null }),
         };
-
         const index = ramps.findIndex((r) => r.id === ramp.id);
         const oldRamp = index !== -1 ? { ...ramps[index] } : null;
-
-        if (index !== -1) {
-            ramps[index] = updatedRamp;
-        }
-
+        if (index !== -1) ramps[index] = updatedRamp;
         isUpdating = true;
         try {
             const updatedRamps: Ramp[] = await invoke("update_ramp", {
                 updatedRamp,
             });
             ramps = updatedRamps;
+            fetchDailyLog(); // refresh log after every status change
         } catch (e) {
             console.error("Failed to update ramp:", e);
-            if (index !== -1 && oldRamp) {
-                ramps[index] = oldRamp;
-            }
-            showError(`Failed to update Ramp ${ramp.id}. Please try again.`);
+            if (index !== -1 && oldRamp) ramps[index] = oldRamp;
+            showError(`Rampe ${ramp.id} konnte nicht aktualisiert werden.`);
         } finally {
             isUpdating = false;
         }
@@ -168,7 +162,6 @@
     async function sendMessage() {
         const text = chatInput.trim();
         if (!text || isSendingMessage) return;
-
         chatInput = "";
         isSendingMessage = true;
         try {
@@ -177,328 +170,914 @@
                 text,
             });
             messages = updated;
+            lastReadCount = messages.length;
             await tick();
             if (chatScrollEl)
                 chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
         } catch (e) {
             console.error("Failed to send message:", e);
             chatInput = text;
-            showError(
-                "Failed to send message. Check your connection to the network drive.",
-            );
+            showError("Nachricht konnte nicht gesendet werden.");
         } finally {
             isSendingMessage = false;
         }
     }
+
+    async function openChat() {
+        chatOpen = true;
+        lastReadCount = messages.length;
+        await tick();
+        if (chatScrollEl) chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+    }
+
+    function closeChat() {
+        chatOpen = false;
+    }
+
+    function parseTsMs(ts: string): number {
+        const ms = new Date(ts).getTime();
+        if (!isNaN(ms)) return ms;
+        // fallback for "YYYY-MM-DD HH:MM:SS" (backend init format)
+        return new Date(ts.replace(" ", "T")).getTime();
+    }
+
+    function getStatusTone(status: string) {
+        if (status === "free")
+            return {
+                fg: "var(--tr-green)",
+                bg: "var(--tr-green-bg)",
+                line: "var(--tr-green-line)",
+                glow: "var(--tr-green-glow)",
+                label: "Frei",
+            };
+        if (status === "pending")
+            return {
+                fg: "var(--tr-warning)",
+                bg: "var(--tr-warning-bg)",
+                line: "var(--tr-warning-line)",
+                glow: "var(--tr-warning-glow)",
+                label: "Wartend",
+            };
+        return {
+            fg: "var(--tr-red)",
+            bg: "var(--tr-red-bg)",
+            line: "var(--tr-red-line)",
+            glow: "var(--tr-red-glow)",
+            label: "Belegt",
+        };
+    }
+
+    function userInitials(user: string): string {
+        return (
+            user
+                .split(/[.\s_-]/)
+                .filter(Boolean)
+                .map((p) => p[0]?.toUpperCase() ?? "")
+                .slice(0, 2)
+                .join("") || "?"
+        );
+    }
+
+    let utilization = $derived(
+        ramps.length > 0
+            ? Math.round(
+                  ((counts.pending + counts.closed) / ramps.length) * 100,
+              )
+            : 0,
+    );
+
+    // ── Inline field editing ──
+    type EditField = "kennzeichen" | "notiz";
+    let editingField = $state<{
+        rampId: number;
+        field: EditField;
+        value: string;
+    } | null>(null);
+
+    function startFieldEdit(ramp: Ramp, field: EditField) {
+        if (isUpdating || isRampLocked(ramp) || !isConnected) return;
+        editingField = { rampId: ramp.id, field, value: ramp[field] ?? "" };
+    }
+
+    async function commitFieldEdit(ramp: Ramp) {
+        if (!editingField || editingField.rampId !== ramp.id) return;
+        const { field, value } = editingField;
+        editingField = null;
+        const trimmed = value.trim();
+        if (trimmed === (ramp[field] ?? "")) return;
+        const updatedRamp: Ramp = {
+            ...ramp,
+            [field]: trimmed || null,
+            last_updated_by: currentUser,
+            // last_updated_at intentionally NOT updated — it tracks when the status
+            // last changed and is the source of truth for the dwell timer
+        };
+        const index = ramps.findIndex((r) => r.id === ramp.id);
+        const snapshot = index !== -1 ? { ...ramps[index] } : null;
+        if (index !== -1) ramps[index] = updatedRamp;
+        isUpdating = true;
+        try {
+            ramps = await invoke("update_ramp", { updatedRamp });
+        } catch (e) {
+            console.error("Failed to save field:", e);
+            if (index !== -1 && snapshot) ramps[index] = snapshot;
+            showError(
+                `Rampe ${ramp.id}: Feld konnte nicht gespeichert werden.`,
+            );
+        } finally {
+            isUpdating = false;
+        }
+    }
+
+    function cancelFieldEdit() {
+        editingField = null;
+    }
+
+    // ── Daily event log ──
+    interface RampEvent {
+        timestamp: string;
+        ramp_id: number;
+        from_status: string;
+        to_status: string;
+        user: string;
+        kennzeichen: string | null;
+        duration_min: number | null;
+    }
+
+    let dailyLog = $state<RampEvent[]>([]);
+    let showProtocol = $state(false);
+
+    // Average time (minutes) spent in any occupied state today
+    let avgDwellToday = $derived(
+        (() => {
+            const relevant = dailyLog.filter(
+                (e) => e.duration_min !== null && e.from_status !== "free",
+            );
+            if (!relevant.length) return null;
+            return Math.round(
+                relevant.reduce((s, e) => s + (e.duration_min ?? 0), 0) /
+                    relevant.length,
+            );
+        })(),
+    );
+
+    async function fetchDailyLog() {
+        try {
+            dailyLog = await invoke<RampEvent[]>("get_daily_log");
+        } catch (e) {
+            console.error("Failed to fetch daily log:", e);
+        }
+    }
+
+    function openProtocol() {
+        fetchDailyLog();
+        showProtocol = true;
+    }
+
+    function fmtStatusDE(s: string) {
+        if (s === "free") return "Frei";
+        if (s === "pending") return "Wartend";
+        return "Belegt";
+    }
+
+    function fmtDuration(min: number | null) {
+        if (min === null) return "—";
+        if (min < 60) return `${min} Min`;
+        const h = Math.floor(min / 60);
+        const m = min % 60;
+        return `${h}h ${String(m).padStart(2, "0")}m`;
+    }
+
+    function focusInput(node: HTMLInputElement) {
+        node.focus();
+        node.select();
+        return {};
+    }
 </script>
 
-<main
-    class="h-screen w-screen overflow-hidden bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-sans flex flex-col p-4 gap-4"
+<!-- Error toast -->
+{#if syncError}
+    <div
+        class="fixed top-4 left-1/2 -translate-x-1/2 z-50 text-white text-sm font-medium px-4 py-2 rounded-lg shadow-xl"
+        style="background: var(--tr-red);"
+    >
+        {syncError}
+    </div>
+{/if}
+
+<div
+    class="h-screen w-screen overflow-hidden flex flex-col"
+    style="background: var(--tr-bg); color: var(--tr-text); font-family: 'Inter Variable', sans-serif;"
 >
-    {#if syncError}
-        <div
-            class="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-rose-600 text-white text-sm font-medium px-4 py-2 rounded-md shadow-lg"
-        >
-            {syncError}
-        </div>
-    {/if}
-
-    <!-- Header -->
-    <header class="flex items-center justify-between gap-4 shrink-0">
-        <div class="flex items-center gap-4">
+    <!-- ── Header ── -->
+    <header
+        class="flex items-center gap-4 px-5 shrink-0"
+        style="height: 60px; background: var(--tr-always-dark); border-bottom: 1px solid var(--tr-line);"
+    >
+        <!-- Logo + Title -->
+        <div class="flex items-center gap-3">
+            <div
+                class="w-8 h-8 rounded-md flex items-center justify-center font-bold text-sm"
+                style="background: var(--tr-red); color: #fff;"
+            >
+                T
+            </div>
             <div>
-                <h1 class="text-xl font-semibold tracking-tight leading-none">
-                    Troiber Ramp Dashboard
-                </h1>
-                <p
-                    class="text-xs text-zinc-500 dark:text-zinc-400 mt-1 font-medium uppercase tracking-wider"
+                <div
+                    class="text-[15px] font-semibold tracking-[-0.2px] leading-none"
+                    style="color: #fff;"
                 >
-                    Ampel-System
-                </p>
-            </div>
-
-            <div
-                class="flex items-center gap-2 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-2.5 py-1.5 rounded-md"
-                title={isConnected
-                    ? "Connected to network drive"
-                    : "Disconnected from network"}
-            >
-                <span
-                    class="w-2 h-2 rounded-full {isConnected
-                        ? 'bg-emerald-500'
-                        : 'bg-rose-500'} {isConnected ? '' : 'animate-pulse'}"
-                ></span>
-                <span
-                    class="text-[0.65rem] font-semibold text-zinc-600 dark:text-zinc-300 uppercase tracking-wider"
+                    Troiber<span
+                        class="font-normal ml-2"
+                        style="color: rgba(255,255,255,0.5);"
+                        >/ Ramp Control</span
+                    >
+                </div>
+                <div
+                    class="font-mono text-[10.5px] uppercase tracking-[1.4px] mt-[3px]"
+                    style="color: rgba(255,255,255,0.45);"
                 >
-                    {isConnected ? "Sync" : "Offline"}
-                </span>
+                    Werk Hofkirchen · nTb
+                </div>
             </div>
         </div>
 
-        <div class="flex items-center gap-2">
-            <Button onclick={toggleMode} variant="outline" size="icon">
-                <SunIcon
-                    class="h-[1.1rem] w-[1.1rem] scale-100 rotate-0 !transition-all dark:scale-0 dark:-rotate-90"
-                />
-                <MoonIcon
-                    class="absolute h-[1.1rem] w-[1.1rem] scale-0 rotate-90 !transition-all dark:scale-100 dark:rotate-0"
-                />
-                <span class="sr-only">Toggle theme</span>
-            </Button>
+        <div class="flex-1"></div>
 
-            <div
-                class="flex items-center gap-2.5 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 pl-1.5 pr-3 py-1.5 rounded-md"
-            >
+        <!-- Sync pill -->
+        <div
+            class="flex items-center gap-2 px-3 py-1.5 rounded-full font-mono text-[11px] tracking-[0.6px]"
+            style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); color: rgba(255,255,255,0.7);"
+        >
+            <span
+                class="w-[7px] h-[7px] rounded-full"
+                class:opacity-50={!isConnected}
+                style="background: var(--tr-green); box-shadow: 0 0 0 3px {isConnected
+                    ? 'rgba(104,197,47,0.15)'
+                    : 'transparent'}, 0 0 8px {isConnected
+                    ? 'rgba(104,197,47,0.6)'
+                    : 'transparent'};"
+            ></span>
+            {isConnected ? "LIVE · 1.5s" : "OFFLINE"}
+        </div>
+
+        <!-- Status chips -->
+        <div class="flex gap-1.5">
+            {#each [{ status: "free", label: "Frei", count: counts.free }, { status: "pending", label: "Wartend", count: counts.pending }, { status: "closed", label: "Belegt", count: counts.closed }] as chip}
+                {@const tone = getStatusTone(chip.status)}
                 <div
-                    class="w-7 h-7 rounded-sm bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center text-sm font-semibold text-white dark:text-zinc-900"
+                    class="flex items-baseline gap-2 px-3 py-1.5 rounded-lg font-mono min-w-[82px]"
+                    style="background: {tone.bg}; border: 1px solid {tone.line};"
                 >
-                    {currentUser.charAt(0).toUpperCase()}
-                </div>
-                <div class="leading-tight">
-                    <p class="text-xs font-semibold">{currentUser}</p>
-                    <p
-                        class="text-[0.6rem] text-zinc-500 dark:text-zinc-400 uppercase tracking-wider"
+                    <span
+                        class="text-[18px] font-semibold leading-none tabular-nums"
+                        style="color: {tone.fg};"
                     >
-                        Operator
-                    </p>
+                        {String(chip.count).padStart(2, "0")}
+                    </span>
+                    <span
+                        class="text-[11px] font-semibold uppercase tracking-[0.6px]"
+                        style="color: {tone.fg};"
+                    >
+                        {chip.label}
+                    </span>
+                </div>
+            {/each}
+        </div>
+
+        <div
+            class="w-px h-6 mx-1"
+            style="background: rgba(255,255,255,0.1);"
+        ></div>
+
+        <!-- Protokoll button -->
+        <button
+            onclick={openProtocol}
+            class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
+            style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
+            aria-label="Tagesprotokoll öffnen"
+        >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            Protokoll
+            {#if dailyLog.length > 0}
+                <span class="font-mono text-[10px]" style="color: rgba(255,255,255,0.45);">{dailyLog.length}</span>
+            {/if}
+        </button>
+
+        <!-- Theme toggle -->
+        <button
+            onclick={toggleMode}
+            class="w-[34px] h-[34px] rounded-[10px] grid place-items-center cursor-pointer transition-colors"
+            style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.7);"
+            aria-label="Theme wechseln"
+        >
+            <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                class="dark:hidden"
+                ><circle cx="12" cy="12" r="4" /><path
+                    d="M12 3v1M12 20v1M4.93 4.93l.71.71M18.36 18.36l.71.71M3 12h1M20 12h1M4.93 19.07l.71-.71M18.36 5.64l.71-.71"
+                /></svg
+            >
+            <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="hidden dark:block"
+                ><path
+                    d="M20.5 14.2A8 8 0 1 1 9.8 3.5a6 6 0 0 0 10.7 10.7z"
+                /></svg
+            >
+        </button>
+
+        <!-- Chat toggle -->
+        <button
+            onclick={chatOpen ? closeChat : openChat}
+            class="relative h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer transition-colors"
+            style="border: 1px solid {chatOpen
+                ? 'var(--tr-red)'
+                : 'rgba(255,255,255,0.1)'}; background: {chatOpen
+                ? 'rgba(218,43,41,0.15)'
+                : 'rgba(255,255,255,0.04)'}; color: {chatOpen
+                ? '#FF6B69'
+                : 'rgba(255,255,255,0.9)'};"
+        >
+            <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                ><path
+                    d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+                /></svg
+            >
+            Team
+            {#if unreadCount > 0}
+                <span
+                    class="min-w-[18px] h-[18px] px-[5px] rounded-full grid place-items-center text-[10px] font-semibold font-mono"
+                    style="background: var(--tr-red); color: #fff;"
+                    >{unreadCount}</span
+                >
+            {/if}
+        </button>
+
+        <!-- User chip -->
+        <div
+            class="flex items-center gap-2.5 pl-1 pr-3 rounded-full"
+            style="background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);"
+        >
+            <div
+                class="w-[26px] h-[26px] rounded-full grid place-items-center text-[11.5px] font-semibold"
+                style="background: var(--tr-red); color: #fff;"
+            >
+                {userInitials(currentUser)}
+            </div>
+            <div class="leading-[1.15]">
+                <div
+                    class="text-[12.5px] font-medium"
+                    style="color: rgba(255,255,255,0.9);"
+                >
+                    {currentUser}
+                </div>
+                <div
+                    class="font-mono text-[10px] uppercase tracking-[0.8px] mt-[1px]"
+                    style="color: rgba(255,255,255,0.45);"
+                >
+                    Operator
                 </div>
             </div>
         </div>
     </header>
 
-    <!-- Main split: ramp grid + chat sidebar -->
-    <div class="flex-1 flex gap-4 min-h-0">
-        <!-- Ramp section -->
-        <section
-            class="flex-1 flex flex-col min-w-0 gap-3 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-lg p-4"
-        >
-            <!-- Section header with counts -->
-            <div class="flex items-center justify-between shrink-0">
+    <!-- ── Body ── -->
+    <div class="flex-1 overflow-hidden relative">
+        <!-- Main scroll area -->
+        <main class="h-full overflow-auto" style="padding: 22px 26px;">
+            <!-- Section header -->
+            <div class="flex items-end justify-between mb-5 gap-6">
                 <div>
-                    <h2 class="text-sm font-semibold uppercase tracking-wider">
-                        Rampen
-                    </h2>
-                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
-                        Klicken um Status zu ändern
-                    </p>
+                    <div class="flex items-center gap-2.5 mb-2">
+                        <span
+                            class="font-mono text-[11px] uppercase tracking-[1.6px] font-medium"
+                            style="color: var(--tr-text-faint);"
+                            >01 / Sektor nTB · Tor 30–42</span
+                        >
+                        <span
+                            class="w-4 h-px"
+                            style="background: var(--tr-line);"
+                        ></span>
+                        <span
+                            class="font-mono text-[11px] uppercase tracking-[1.6px] font-medium"
+                            style="color: var(--tr-text-faint);">13 Rampen</span
+                        >
+                    </div>
+                    <h1 class="text-[24px] font-semibold tracking-[-0.4px] m-0">
+                        Rampenbelegung
+                    </h1>
                 </div>
-                <div class="flex items-center gap-2 text-sm font-semibold">
-                    <span
-                        class="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30"
+                <div
+                    class="flex items-center gap-2 text-[11.5px]"
+                    style="color: var(--tr-text-faint);"
+                >
+                    <kbd
+                        class="px-[7px] py-[2px] rounded-[5px] font-mono text-[10.5px]"
+                        style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
+                        >Klick</kbd
                     >
-                        <span
-                            class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]"
-                        ></span>
-                        {counts.free} Frei
-                    </span>
-                    <span
-                        class="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/30"
-                    >
-                        <span
-                            class="w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)]"
-                        ></span>
-                        {counts.pending} Wartend
-                    </span>
-                    <span
-                        class="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-500/30"
-                    >
-                        <span
-                            class="w-2 h-2 rounded-full bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]"
-                        ></span>
-                        {counts.closed} Belegt
-                    </span>
+                    Status · KFZ / Notiz anklicken zum Bearbeiten
                 </div>
             </div>
 
-            <!-- Tile grid -->
+            <!-- Ramp grid -->
             {#if ramps.length === 0}
                 <div
-                    class="flex-1 flex flex-col items-center justify-center text-zinc-500"
+                    class="flex flex-col items-center justify-center py-24 gap-3"
+                    style="color: var(--tr-text-faint);"
                 >
                     <div
-                        class="w-8 h-8 border-2 border-zinc-300 dark:border-zinc-700 border-t-emerald-500 rounded-full animate-spin mb-3"
+                        class="w-8 h-8 border-2 border-t-[color:var(--tr-green)] rounded-full animate-spin"
+                        style="border-color: var(--tr-line); border-top-color: var(--tr-green);"
                     ></div>
                     <p class="text-sm font-medium">Verbinde…</p>
                 </div>
             {:else}
-                <div class="flex-1 grid grid-cols-13 gap-2 min-h-0">
+                <div
+                    style="display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px;"
+                >
                     {#each ramps as ramp (ramp.id)}
                         {@const locked = isRampLocked(ramp)}
-                        {@const occupied = ramp.status !== "free"}
-                        {@const docked = ramp.status === "closed"}
-                        {@const apronBg =
-                            ramp.status === "free"
-                                ? "bg-emerald-500"
-                                : ramp.status === "pending"
-                                  ? "bg-amber-400"
-                                  : "bg-rose-500"}
-                        {@const doorGradient =
-                            ramp.status === "free"
-                                ? "bg-gradient-to-b from-emerald-300 to-emerald-600"
-                                : ramp.status === "pending"
-                                  ? "bg-gradient-to-b from-amber-200 to-amber-500"
-                                  : "bg-gradient-to-b from-rose-300 to-rose-600"}
-                        {@const glow =
-                            ramp.status === "free"
-                                ? "shadow-emerald-500/40 hover:shadow-emerald-500/60"
-                                : ramp.status === "pending"
-                                  ? "shadow-amber-500/40 hover:shadow-amber-500/60"
-                                  : "shadow-rose-500/40 hover:shadow-rose-500/60"}
-                        {@const iconColor =
-                            ramp.status === "free"
-                                ? "text-emerald-600 dark:text-emerald-400"
-                                : ramp.status === "pending"
-                                  ? "text-amber-600 dark:text-amber-400"
-                                  : "text-rose-600 dark:text-rose-400"}
-                        <button
-                            class="relative flex flex-col rounded-xl overflow-hidden border-2 border-white/60 dark:border-zinc-600
-                                   shadow-lg {glow}
-                                   transition-all duration-200 ease-out text-left
-                                   hover:scale-[1.03] hover:-translate-y-0.5 hover:shadow-xl
-                                   active:scale-[0.97]
-                                   disabled:cursor-not-allowed
-                                   {locked ? 'opacity-95' : ''}"
-                            onclick={() => cycleStatus(ramp)}
-                            aria-label="Ramp {ramp.id}, status: {getStatusLabel(
+                        {@const tone = getStatusTone(ramp.status)}
+                        {@const isFree = ramp.status === "free"}
+                        {@const dwellSec = (!isFree && ramp.last_updated_at)
+                            ? Math.max(0, Math.floor((now - parseTsMs(ramp.last_updated_at)) / 1000))
+                            : 0}
+                        {@const dwellH = Math.floor(dwellSec / 3600)}
+                        {@const dwellM = Math.floor((dwellSec % 3600) / 60)}
+                        {@const dwellS = dwellSec % 60}
+                        {@const dwell = dwellH > 0
+                            ? `${String(dwellH).padStart(2,"0")}:${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`
+                            : `${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`}
+                        {@const dt = ramp.last_updated_at
+                            ? new Date(ramp.last_updated_at)
+                            : null}
+                        {@const timeStr = dt
+                            ? dt.toLocaleTimeString("de-DE", {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                              })
+                            : null}
+                        {@const canEdit = isConnected && !isUpdating && !locked}
+                        {@const isEditKfz =
+                            editingField?.rampId === ramp.id &&
+                            editingField?.field === "kennzeichen"}
+                        {@const isEditNotiz =
+                            editingField?.rampId === ramp.id &&
+                            editingField?.field === "notiz"}
+
+                        <!-- div+role avoids invalid nested-interactive HTML -->
+                        <div
+                            class="ramp-tile relative rounded-[12px] flex flex-col gap-[9px]"
+                            role="button"
+                            tabindex="0"
+                            aria-label="Rampe {ramp.id}, {getStatusLabel(
                                 ramp.status,
-                            )}. Click to change."
-                            disabled={!isConnected || isUpdating || locked}
+                            )}. Enter um Status zu ändern."
+                            onclick={(e) => {
+                                if (
+                                    (e.target as HTMLElement).closest(
+                                        "[data-field]",
+                                    )
+                                )
+                                    return;
+                                if (canEdit) cycleStatus(ramp);
+                            }}
+                            onkeydown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                    e.preventDefault();
+                                    if (canEdit) cycleStatus(ramp);
+                                }
+                            }}
+                            style="
+                                padding: 13px 13px 11px;
+                                cursor: {canEdit ? 'pointer' : 'default'};
+                                background: {isFree
+                                ? 'var(--tr-surface)'
+                                : 'linear-gradient(180deg, ' +
+                                  tone.bg +
+                                  ' 0%, var(--tr-surface) 72%)'};
+                                border: 1px solid {isFree
+                                ? 'var(--tr-line)'
+                                : tone.line};
+                                box-shadow: {isFree
+                                ? 'none'
+                                : '0 0 24px -10px ' + tone.glow};
+                            "
                         >
+                            <!-- Lock overlay -->
                             {#if locked}
                                 <div
-                                    class="absolute inset-0 z-30 bg-black/20 dark:bg-black/45 flex items-center justify-center pointer-events-none backdrop-blur-[1px]"
+                                    class="absolute inset-0 z-30 rounded-[12px] flex items-center justify-center backdrop-blur-[1px]"
+                                    style="background: rgba(0,0,0,0.28);"
                                 >
                                     <LoaderCircleIcon
-                                        class="w-6 h-6 text-white drop-shadow-md animate-spin"
+                                        class="w-6 h-6 animate-spin"
+                                        style="color:#fff"
                                     />
                                 </div>
                             {/if}
 
-                            <!-- Building wall: number + status icon -->
+                            <!-- Top accent stripe -->
                             <div
-                                class="flex items-center justify-between px-1.5 pt-1.5 pb-1.5 bg-gradient-to-b from-zinc-200 to-zinc-300 dark:from-zinc-700 dark:to-zinc-800"
-                            >
-                                <span
-                                    class="text-2xl font-extrabold text-zinc-800 dark:text-zinc-100 leading-none tracking-tight"
+                                class="absolute top-0 left-0 right-0 h-[3px] rounded-t-[12px]"
+                                style="background: {tone.fg}; opacity: {isFree
+                                    ? 0.35
+                                    : 1};"
+                            ></div>
+
+                            <!-- Row 1: number + status badge -->
+                            <div class="flex items-start justify-between gap-2">
+                                <div
+                                    class="font-semibold leading-none tabular-nums"
+                                    style="font-size: 34px; letter-spacing: -1px; color: var(--tr-text);"
                                 >
                                     {ramp.id}
+                                </div>
+                                <span
+                                    class="inline-flex items-center gap-[5px] px-2 py-1 rounded-[6px] font-mono text-[10px] font-semibold uppercase tracking-[0.6px]"
+                                    style="background: {tone.bg}; border: 1px solid {tone.line}; color: {tone.fg};"
+                                >
+                                    <span
+                                        class="w-[6px] h-[6px] rounded-full flex-shrink-0"
+                                        style="background: {tone.fg}; box-shadow: {!isFree
+                                            ? '0 0 6px ' + tone.glow
+                                            : 'none'}; animation: {ramp.status ===
+                                        'pending'
+                                            ? 'mc-pulse 1.6s ease-in-out infinite'
+                                            : 'none'};"
+                                    ></span>
+                                    {tone.label}
                                 </span>
-                                {#if ramp.status === "free"}
-                                    <CheckIcon
-                                        class="w-4 h-4 {iconColor} drop-shadow-sm shrink-0"
-                                    />
-                                {:else if ramp.status === "pending"}
-                                    <ClockIcon
-                                        class="w-4 h-4 {iconColor} drop-shadow-sm shrink-0"
-                                    />
+                            </div>
+
+                            <!-- Row 2: Kennzeichen -->
+                            <div
+                                data-field="kennzeichen"
+                                class="rounded-[5px] overflow-hidden"
+                                style="border: 1px solid {isEditKfz
+                                    ? 'var(--tr-warning)'
+                                    : 'var(--tr-line)'}; background: var(--tr-surface2);"
+                            >
+                                {#if isEditKfz}
+                                    <div
+                                        class="flex items-center gap-1.5 px-[8px] py-[5px]"
+                                    >
+                                        <span
+                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
+                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                            >KFZ</span
+                                        >
+                                        <input
+                                            type="text"
+                                            class="flex-1 min-w-0 font-mono text-[12px] font-medium bg-transparent outline-none"
+                                            style="color:var(--tr-text); letter-spacing:0.5px;"
+                                            value={editingField!.value}
+                                            maxlength={15}
+                                            placeholder="z.B. M-TR 2418"
+                                            oninput={(e) => {
+                                                if (editingField)
+                                                    editingField.value =
+                                                        e.currentTarget.value;
+                                            }}
+                                            onblur={() => commitFieldEdit(ramp)}
+                                            onkeydown={(e) => {
+                                                if (e.key === "Enter") {
+                                                    e.preventDefault();
+                                                    commitFieldEdit(ramp);
+                                                }
+                                                if (e.key === "Escape") {
+                                                    e.preventDefault();
+                                                    cancelFieldEdit();
+                                                }
+                                            }}
+                                            onclick={(e) => e.stopPropagation()}
+                                            use:focusInput
+                                        />
+                                    </div>
                                 {:else}
-                                    <LockIcon
-                                        class="w-4 h-4 {iconColor} drop-shadow-sm shrink-0"
-                                    />
+                                    <button
+                                        class="w-full flex items-center gap-1.5 px-[8px] py-[5px] text-left"
+                                        style="background:transparent; border:none; cursor:{canEdit
+                                            ? 'text'
+                                            : 'default'};"
+                                        disabled={!canEdit}
+                                        onclick={(e) => {
+                                            e.stopPropagation();
+                                            startFieldEdit(ramp, "kennzeichen");
+                                        }}
+                                        aria-label="Kennzeichen bearbeiten"
+                                        tabindex="-1"
+                                    >
+                                        <span
+                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
+                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                            >KFZ</span
+                                        >
+                                        <span
+                                            class="font-mono text-[12px] font-medium truncate"
+                                            style="color:{ramp.kennzeichen
+                                                ? 'var(--tr-text)'
+                                                : 'var(--tr-text-faint)'}; letter-spacing:0.5px;"
+                                        >
+                                            {ramp.kennzeichen || "— — —"}
+                                        </span>
+                                    </button>
                                 {/if}
                             </div>
 
-                            <!-- Dock door: thick LED-like bar -->
+                            <!-- Row 3: Notiz -->
                             <div
-                                class="h-4 {doorGradient} border-y border-zinc-700/30 shadow-inner"
-                            ></div>
-
-                            <!-- Apron: full status-colored bay -->
-                            <div
-                                class="relative flex-1 {apronBg} overflow-hidden shadow-inner"
+                                data-field="notiz"
+                                class="rounded-[5px] overflow-hidden"
+                                style="border: 1px solid {isEditNotiz
+                                    ? 'var(--tr-warning)'
+                                    : 'var(--tr-line)'}; background: var(--tr-surface2);"
                             >
-                                <!-- Center lane marking -->
-                                <div
-                                    class="absolute inset-y-2 left-1/2 -translate-x-1/2 w-px border-l-2 border-dashed border-white/40"
-                                ></div>
-
-                                {#if occupied}
+                                {#if isEditNotiz}
                                     <div
-                                        class="absolute left-1/2 -translate-x-1/2 w-[78%] h-[60%] flex flex-col items-stretch transition-all duration-500 ease-out
-                                               {docked
-                                            ? 'top-0'
-                                            : 'top-[30%] animate-pulse'}"
+                                        class="flex items-center gap-1.5 px-[8px] py-[5px]"
                                     >
-                                        <!-- Trailer -->
-                                        <div
-                                            class="flex-1 bg-white border-2 border-zinc-800 rounded-md shadow-md flex items-center justify-center"
+                                        <span
+                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
+                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                            >Notiz</span
                                         >
-                                            <TruckIcon
-                                                class="w-4 h-4 text-zinc-500 rotate-90"
-                                            />
-                                        </div>
-                                        <!-- Cab -->
+                                        <input
+                                            type="text"
+                                            class="flex-1 min-w-0 text-[11px] bg-transparent outline-none"
+                                            style="color:var(--tr-text);"
+                                            value={editingField!.value}
+                                            maxlength={60}
+                                            placeholder="Kurze Notiz…"
+                                            oninput={(e) => {
+                                                if (editingField)
+                                                    editingField.value =
+                                                        e.currentTarget.value;
+                                            }}
+                                            onblur={() => commitFieldEdit(ramp)}
+                                            onkeydown={(e) => {
+                                                if (e.key === "Enter") {
+                                                    e.preventDefault();
+                                                    commitFieldEdit(ramp);
+                                                }
+                                                if (e.key === "Escape") {
+                                                    e.preventDefault();
+                                                    cancelFieldEdit();
+                                                }
+                                            }}
+                                            onclick={(e) => e.stopPropagation()}
+                                            use:focusInput
+                                        />
+                                    </div>
+                                {:else}
+                                    <button
+                                        class="w-full flex items-center gap-1.5 px-[8px] py-[5px] text-left"
+                                        style="background:transparent; border:none; cursor:{canEdit
+                                            ? 'text'
+                                            : 'default'};"
+                                        disabled={!canEdit}
+                                        onclick={(e) => {
+                                            e.stopPropagation();
+                                            startFieldEdit(ramp, "notiz");
+                                        }}
+                                        aria-label="Notiz bearbeiten"
+                                        tabindex="-1"
+                                    >
+                                        <span
+                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
+                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                            >Notiz</span
+                                        >
+                                        <span
+                                            class="text-[11px] truncate"
+                                            style="color:{ramp.notiz
+                                                ? 'var(--tr-text-dim)'
+                                                : 'var(--tr-text-faint)'};"
+                                        >
+                                            {ramp.notiz || "—"}
+                                        </span>
+                                    </button>
+                                {/if}
+                            </div>
+
+                            <!-- Row 4: dwell / time -->
+                            <div
+                                class="mt-auto flex justify-between items-end pt-1"
+                            >
+                                {#if !isFree}
+                                    <div>
                                         <div
-                                            class="w-[80%] mx-auto bg-zinc-800 dark:bg-zinc-900 border-2 border-zinc-900 rounded-md h-5 mt-0.5 shadow-sm"
-                                        ></div>
+                                            class="font-mono text-[9px] uppercase mb-1"
+                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                        >
+                                            Verweildauer
+                                        </div>
+                                        <div
+                                            class="font-mono text-[17px] font-semibold leading-none tabular-nums"
+                                            style="color:{tone.fg};"
+                                        >
+                                            {dwell}
+                                        </div>
+                                    </div>
+                                    <div class="text-right">
+                                        <div
+                                            class="font-mono text-[9px] uppercase mb-1"
+                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                        >
+                                            Seit
+                                        </div>
+                                        <div
+                                            class="text-[12px] font-medium"
+                                            style="color:var(--tr-text-dim);"
+                                        >
+                                            {timeStr ?? "—"}
+                                        </div>
+                                    </div>
+                                {:else}
+                                    <div
+                                        class="font-mono text-[10px]"
+                                        style="color:var(--tr-text-faint); letter-spacing:0.4px;"
+                                    >
+                                        {timeStr
+                                            ? "Frei seit " + timeStr
+                                            : "Noch nie belegt"}
                                     </div>
                                 {/if}
                             </div>
-
-                            <!-- Info strip -->
-                            <div
-                                class="bg-zinc-100/95 dark:bg-zinc-800/95 backdrop-blur-sm border-t border-zinc-300 dark:border-zinc-700 px-1 py-1 text-center"
-                            >
-                                {#if ramp.last_updated_at}
-                                    {@const dt = formatDateTime(
-                                        ramp.last_updated_at,
-                                    )}
-                                    <p
-                                        class="text-[0.55rem] font-bold truncate text-zinc-700 dark:text-zinc-200"
-                                    >
-                                        {ramp.last_updated_by}
-                                    </p>
-                                    <p
-                                        class="text-[0.5rem] text-zinc-500 dark:text-zinc-400 truncate"
-                                    >
-                                        {dt.time}
-                                    </p>
-                                    <p
-                                        class="text-[0.5rem] text-zinc-500 dark:text-zinc-400 truncate"
-                                    >
-                                        {dt.date}
-                                    </p>
-                                {:else}
-                                    <p
-                                        class="text-[0.55rem] text-zinc-400 dark:text-zinc-500 italic"
-                                    >
-                                        —
-                                    </p>
-                                {/if}
-                            </div>
-                        </button>
+                        </div>
                     {/each}
                 </div>
             {/if}
-        </section>
 
-        <!-- Chat sidebar -->
+            <!-- Stats strip -->
+            {#if ramps.length > 0}
+                <div
+                    class="mt-5 rounded-[12px] grid gap-7"
+                    style="padding: 16px 20px; background: var(--tr-surface); border: 1px solid var(--tr-line); grid-template-columns: 1fr 1fr 1fr 1fr;"
+                >
+                    <div class="flex flex-col gap-1.5">
+                        <div
+                            class="font-mono text-[10px] uppercase tracking-[1.2px] font-medium"
+                            style="color: var(--tr-text-faint);"
+                        >
+                            Ø Verweildauer heute
+                        </div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span
+                                class="font-mono text-[22px] font-semibold leading-none tabular-nums"
+                                style="color: {avgDwellToday !== null ? 'var(--tr-warning)' : 'var(--tr-text)'};"
+                            >
+                                {avgDwellToday !== null
+                                    ? String(Math.floor(avgDwellToday / 60)).padStart(2, "0") +
+                                      ":" +
+                                      String(avgDwellToday % 60).padStart(2, "0")
+                                    : "—"}
+                            </span>
+                            <span
+                                class="text-[10px] uppercase tracking-[0.6px]"
+                                style="color: var(--tr-text-faint);"
+                                >{avgDwellToday !== null ? "HH:MM" : "keine Daten"}</span
+                            >
+                        </div>
+                    </div>
+                    <div class="flex flex-col gap-1.5">
+                        <div
+                            class="font-mono text-[10px] uppercase tracking-[1.2px] font-medium"
+                            style="color: var(--tr-text-faint);"
+                        >
+                            Wartend
+                        </div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span
+                                class="font-mono text-[22px] font-semibold leading-none tabular-nums"
+                                style="color: var(--tr-warning);"
+                                >{String(counts.pending).padStart(2, "0")}</span
+                            >
+                            <span
+                                class="text-[10px] uppercase tracking-[0.6px]"
+                                style="color: var(--tr-text-faint);">LKW</span
+                            >
+                        </div>
+                    </div>
+                    <div class="flex flex-col gap-1.5">
+                        <div
+                            class="font-mono text-[10px] uppercase tracking-[1.2px] font-medium"
+                            style="color: var(--tr-text-faint);"
+                        >
+                            Belegt
+                        </div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span
+                                class="font-mono text-[22px] font-semibold leading-none tabular-nums"
+                                style="color: var(--tr-red);"
+                                >{String(counts.closed).padStart(2, "0")}</span
+                            >
+                            <span
+                                class="text-[10px] uppercase tracking-[0.6px]"
+                                style="color: var(--tr-text-faint);">LKW</span
+                            >
+                        </div>
+                    </div>
+                    <div class="flex flex-col gap-1.5">
+                        <div
+                            class="font-mono text-[10px] uppercase tracking-[1.2px] font-medium"
+                            style="color: var(--tr-text-faint);"
+                        >
+                            Auslastung
+                        </div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span
+                                class="font-mono text-[22px] font-semibold leading-none tabular-nums"
+                                style="color: var(--tr-text);"
+                                >{utilization}%</span
+                            >
+                            <span
+                                class="text-[10px] uppercase tracking-[0.6px]"
+                                style="color: var(--tr-text-faint);"
+                                >{counts.pending + counts.closed} / {ramps.length}</span
+                            >
+                        </div>
+                    </div>
+                </div>
+            {/if}
+        </main>
+
+        <!-- ── Chat panel ── -->
         <aside
-            class="w-[360px] shrink-0 flex flex-col min-h-0 border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-lg overflow-hidden"
+            class="absolute top-0 right-0 bottom-0 overflow-hidden flex flex-col chat-panel"
+            style="width: {chatOpen
+                ? '360px'
+                : '0px'}; background: var(--tr-surface); border-left: 1px solid {chatOpen
+                ? 'var(--tr-line)'
+                : 'transparent'};"
         >
-            <header
-                class="flex items-center justify-between px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 shrink-0"
+            <!-- Chat header -->
+            <div
+                class="flex items-start gap-2.5 px-5 py-[18px] shrink-0"
+                style="border-bottom: 1px solid var(--tr-line);"
             >
-                <div>
-                    <h2 class="text-sm font-semibold uppercase tracking-wider">
-                        Troiber Team Chat
-                    </h2>
-                    <p
-                        class="text-[0.65rem] text-zinc-500 dark:text-zinc-400 mt-0.5"
+                <div class="flex-1 min-w-0">
+                    <div
+                        class="text-[14px] font-semibold tracking-[-0.1px]"
+                        style="color: var(--tr-text);"
+                    >
+                        Team Chat
+                    </div>
+                    <div
+                        class="font-mono text-[10.5px] uppercase tracking-[0.6px] mt-[3px]"
+                        style="color: var(--tr-text-faint);"
                     >
                         {messages.length} Nachrichten
-                    </p>
+                    </div>
                 </div>
-            </header>
+                <button
+                    onclick={closeChat}
+                    aria-label="Chat schließen"
+                    class="w-7 h-7 rounded-[7px] grid place-items-center cursor-pointer transition-colors"
+                    style="border: 1px solid var(--tr-line); background: transparent; color: var(--tr-text-dim);"
+                >
+                    <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg
+                    >
+                </button>
+            </div>
 
+            <!-- Messages -->
             <div
                 bind:this={chatScrollEl}
-                class="flex-1 overflow-y-auto chat-scroll px-3 py-3 min-h-0"
+                class="flex-1 overflow-y-auto chat-scroll flex flex-col gap-4 min-h-0"
+                style="padding: 16px 18px;"
             >
                 {#if messages.length === 0}
                     <p
-                        class="text-zinc-400 dark:text-zinc-600 text-xs text-center my-auto pt-12"
+                        class="text-xs text-center pt-12"
+                        style="color: var(--tr-text-faint);"
                     >
                         Noch keine Nachrichten
                     </p>
@@ -507,80 +1086,102 @@
                 {#each messages as msg, i (msg.id)}
                     {@const isOwn = msg.user === currentUser}
                     {@const prevMsg = i > 0 ? messages[i - 1] : null}
-                    {@const isFirstFromUser =
-                        !prevMsg || prevMsg.user !== msg.user}
-                    {@const isDifferentDay =
+                    {@const isFirst = !prevMsg || prevMsg.user !== msg.user}
+                    {@const isDiffDay =
                         !prevMsg ||
                         formatDate(msg.timestamp) !==
                             formatDate(prevMsg.timestamp)}
 
-                    {#if isDifferentDay}
-                        <div class="flex items-center gap-2 my-3">
+                    {#if isDiffDay}
+                        <div class="flex items-center gap-2 my-1">
                             <div
-                                class="flex-1 h-px bg-zinc-200 dark:bg-zinc-800"
+                                class="flex-1 h-px"
+                                style="background: var(--tr-line);"
                             ></div>
                             <span
-                                class="text-[0.6rem] font-medium text-zinc-500 uppercase tracking-widest"
+                                class="font-mono text-[10px] uppercase tracking-[1.2px]"
+                                style="color: var(--tr-text-faint);"
                                 >{formatDate(msg.timestamp)}</span
                             >
                             <div
-                                class="flex-1 h-px bg-zinc-200 dark:bg-zinc-800"
+                                class="flex-1 h-px"
+                                style="background: var(--tr-line);"
                             ></div>
                         </div>
                     {/if}
 
                     <div
-                        class="flex items-end gap-1.5 {isOwn
+                        class="flex gap-2.5 {isOwn
                             ? 'flex-row-reverse'
-                            : 'flex-row'} {isFirstFromUser
-                            ? 'mt-2.5'
-                            : 'mt-0.5'}"
+                            : 'flex-row'} {isFirst ? 'mt-1' : 'mt-[-6px]'}"
                     >
                         {#if !isOwn}
-                            {#if isFirstFromUser}
+                            {#if isFirst}
                                 <div
-                                    class="w-6 h-6 rounded-sm bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center text-[0.6rem] font-semibold text-white dark:text-zinc-900 shrink-0 mb-0.5"
+                                    class="w-7 h-7 rounded-full grid place-items-center text-[11.5px] font-semibold shrink-0 mb-[2px]"
+                                    style="background: var(--tr-surface2); border: 1px solid var(--tr-line); color: var(--tr-text-dim);"
                                 >
                                     {msg.user.charAt(0).toUpperCase()}
                                 </div>
                             {:else}
-                                <div class="w-6 shrink-0"></div>
+                                <div class="w-7 shrink-0"></div>
                             {/if}
                         {/if}
 
                         <div
                             class="flex flex-col {isOwn
                                 ? 'items-end'
-                                : 'items-start'} max-w-[75%]"
+                                : 'items-start'} max-w-[78%]"
                         >
-                            {#if isFirstFromUser && !isOwn}
-                                <span
-                                    class="text-[0.6rem] font-semibold text-zinc-600 dark:text-zinc-400 mb-0.5 ml-2 truncate max-w-full"
-                                    >{msg.user}</span
+                            {#if isFirst && !isOwn}
+                                <div
+                                    class="font-mono text-[11px] mb-[5px]"
+                                    style="color: var(--tr-text-dim);"
                                 >
+                                    {msg.user}
+                                    <span style="color: var(--tr-text-faint);"
+                                        >· {formatTime(msg.timestamp)}</span
+                                    >
+                                </div>
                             {/if}
                             <div
-                                class="px-3 py-1.5 text-xs leading-relaxed break-words rounded-md {isOwn
-                                    ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-                                    : 'bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100'}"
+                                class="text-[13px] leading-[1.45] px-[13px] py-2 break-words"
+                                style="
+                                     background: {isOwn
+                                    ? 'var(--tr-red)'
+                                    : 'var(--tr-surface2)'};
+                                     color: {isOwn ? '#fff' : 'var(--tr-text)'};
+                                     border-radius: {isOwn
+                                    ? '12px 12px 3px 12px'
+                                    : '3px 12px 12px 12px'};
+                                     border: {isOwn
+                                    ? 'none'
+                                    : '1px solid var(--tr-line)'};
+                                 "
                             >
                                 {msg.text}
                             </div>
-                            <span
-                                class="text-[0.55rem] text-zinc-500 dark:text-zinc-500 mt-0.5 mx-1"
-                                >{formatTime(msg.timestamp)}</span
-                            >
+                            {#if isOwn}
+                                <div
+                                    class="font-mono text-[10.5px] mt-[5px]"
+                                    style="color: var(--tr-text-faint);"
+                                >
+                                    {formatTime(msg.timestamp)}
+                                </div>
+                            {/if}
                         </div>
                     </div>
                 {/each}
             </div>
 
+            <!-- Input -->
             <form
                 onsubmit={(e) => {
                     e.preventDefault();
                     sendMessage();
                 }}
-                class="flex items-center gap-2 p-3 border-t border-zinc-200 dark:border-zinc-800 shrink-0"
+                class="flex gap-2 shrink-0 p-[12px_14px]"
+                style="border-top: 1px solid var(--tr-line);"
             >
                 <input
                     type="text"
@@ -591,22 +1192,184 @@
                     onkeydown={(e) => {
                         if (e.key === "Escape") e.currentTarget.blur();
                     }}
-                    class="flex-1 bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-1.5 text-xs text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-600 transition-colors disabled:opacity-50"
+                    class="flex-1 h-9 px-3 rounded-[8px] text-[13px] outline-none transition-colors disabled:opacity-50"
+                    style="border: 1px solid var(--tr-line); background: var(--tr-bg); color: var(--tr-text); font-family: 'Inter Variable', sans-serif;"
                 />
                 <button
                     type="submit"
                     disabled={isSendingMessage || !chatInput.trim()}
-                    aria-label="Send message"
-                    class="w-8 h-8 flex items-center justify-center bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:hover:bg-white text-white dark:text-zinc-900 disabled:opacity-40 disabled:cursor-not-allowed rounded-md transition-colors shrink-0"
+                    aria-label="Senden"
+                    class="w-9 h-9 rounded-[8px] grid place-items-center cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed transition-opacity"
+                    style="border: none; background: var(--tr-red); color: #fff;"
                 >
-                    <SendIcon class="w-3.5 h-3.5" />
+                    <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        ><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" /></svg
+                    >
                 </button>
             </form>
         </aside>
     </div>
-</main>
+</div>
+
+<!-- ── Tagesprotokoll Modal ── -->
+{#if showProtocol}
+    <div
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
+        onclick={(e) => { if (e.target === e.currentTarget) showProtocol = false; }}
+        onkeydown={(e) => { if (e.key === "Escape") showProtocol = false; }}
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-label="Tagesprotokoll"
+    >
+        <div
+            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+            style="width: 1100px; max-width: 95vw; max-height: 85vh; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+        >
+            <!-- Modal header -->
+            <div
+                class="flex items-center gap-4 px-6 py-4 shrink-0"
+                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
+            >
+                <div class="flex-1">
+                    <div class="text-[15px] font-semibold" style="color: #fff;">Tagesprotokoll</div>
+                    <div class="font-mono text-[10.5px] uppercase mt-[3px]"
+                         style="letter-spacing: 1.4px; color: rgba(255,255,255,0.45);">
+                        {new Date().toLocaleDateString("de-DE", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })}
+                        &nbsp;·&nbsp; {dailyLog.length} Ereignisse
+                    </div>
+                </div>
+                <button
+                    onclick={() => window.print()}
+                    class="h-8 px-4 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
+                    style="border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.8);"
+                    aria-label="Drucken"
+                >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+                    Drucken
+                </button>
+                <button
+                    onclick={() => (showProtocol = false)}
+                    aria-label="Schließen"
+                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                    style="border: 1px solid rgba(255,255,255,0.1); background: transparent; color: rgba(255,255,255,0.6);"
+                >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- Table -->
+            <div class="flex-1 overflow-auto chat-scroll">
+                {#if dailyLog.length === 0}
+                    <div class="flex flex-col items-center justify-center py-20 gap-3"
+                         style="color: var(--tr-text-faint);">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        <p class="text-sm font-medium">Noch keine Ereignisse heute</p>
+                    </div>
+                {:else}
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr style="position: sticky; top: 0; background: var(--tr-surface2); border-bottom: 1px solid var(--tr-line);">
+                                {#each ["Zeit", "Rampe", "Vorher → Nachher", "Dauer", "Fahrer", "Kennzeichen"] as col}
+                                    <th class="font-mono text-[10px] font-semibold uppercase px-4 py-3"
+                                        style="letter-spacing: 1px; color: var(--tr-text-faint); white-space: nowrap;">{col}</th>
+                                {/each}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#each [...dailyLog].reverse() as ev, i}
+                                {@const tone = getStatusTone(ev.to_status)}
+                                <tr style="border-bottom: 1px solid var(--tr-line); background: {i % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.03)'};">
+                                    <td class="px-4 py-2.5 font-mono text-[12px]" style="color: var(--tr-text-dim); white-space: nowrap;">
+                                        {new Date(ev.timestamp).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                                    </td>
+                                    <td class="px-4 py-2.5">
+                                        <span class="font-mono text-[15px] font-semibold" style="color: var(--tr-text);">{ev.ramp_id}</span>
+                                    </td>
+                                    <td class="px-4 py-2.5">
+                                        <div class="flex items-center gap-2 text-[12px]">
+                                            <span class="font-mono px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase"
+                                                  style="background: {getStatusTone(ev.from_status).bg}; color: {getStatusTone(ev.from_status).fg}; border: 1px solid {getStatusTone(ev.from_status).line};">
+                                                {fmtStatusDE(ev.from_status)}
+                                            </span>
+                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color: var(--tr-text-faint);"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                                            <span class="font-mono px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase"
+                                                  style="background: {tone.bg}; color: {tone.fg}; border: 1px solid {tone.line};">
+                                                {fmtStatusDE(ev.to_status)}
+                                            </span>
+                                        </div>
+                                    </td>
+                                    <td class="px-4 py-2.5 font-mono text-[12px]" style="color: var(--tr-text-dim);">
+                                        {fmtDuration(ev.duration_min)}
+                                    </td>
+                                    <td class="px-4 py-2.5 text-[12px]" style="color: var(--tr-text-dim);">{ev.user}</td>
+                                    <td class="px-4 py-2.5 font-mono text-[12px]"
+                                        style="color: {ev.kennzeichen ? 'var(--tr-text)' : 'var(--tr-text-faint)'};">
+                                        {ev.kennzeichen || "—"}
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+            </div>
+
+            <!-- Summary footer -->
+            {#if dailyLog.length > 0}
+                <div class="flex items-center gap-8 px-6 py-3 shrink-0"
+                     style="border-top: 1px solid var(--tr-line); background: var(--tr-surface2);">
+                    <div class="flex items-baseline gap-2">
+                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Statuswechsel</span>
+                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-text);">{dailyLog.length}</span>
+                    </div>
+                    <div class="flex items-baseline gap-2">
+                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Ø Verweildauer</span>
+                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-warning);">
+                            {avgDwellToday !== null ? fmtDuration(avgDwellToday) : "—"}
+                        </span>
+                    </div>
+                    <div class="flex items-baseline gap-2">
+                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Abfertigungen</span>
+                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-green);">
+                            {dailyLog.filter((e) => e.to_status === "free").length}
+                        </span>
+                    </div>
+                </div>
+            {/if}
+        </div>
+    </div>
+{/if}
 
 <style>
+    @keyframes mc-pulse {
+        0%,
+        100% {
+            opacity: 1;
+        }
+        50% {
+            opacity: 0.35;
+        }
+    }
+
+    .ramp-tile:hover {
+        transform: scale(1.02) translateY(-1px);
+        box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.25);
+    }
+    .ramp-tile:active {
+        transform: scale(0.98);
+    }
+
+    .chat-panel {
+        transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
     .chat-scroll {
         scrollbar-width: thin;
         scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
