@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -8,6 +8,18 @@ use tauri::command;
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
 const MAX_CHAT_MESSAGES: usize = 100;
+const MAX_LOG_EVENTS: usize = 500;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RampEvent {
+    timestamp: String,
+    ramp_id: u32,
+    from_status: String,
+    to_status: String,
+    user: String,
+    kennzeichen: Option<String>,
+    duration_min: Option<i64>,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Ramp {
@@ -43,6 +55,15 @@ fn get_db_path() -> PathBuf {
     path
 }
 
+fn get_log_path() -> PathBuf {
+    let mut path = std::env::current_exe()
+        .or_else(|_| std::env::current_dir())
+        .expect("Cannot determine path");
+    path.pop();
+    path.push("ramp_events.json");
+    path
+}
+
 fn get_chat_path() -> PathBuf {
     let mut path = std::env::current_exe()
         .or_else(|_| std::env::current_dir())
@@ -50,6 +71,37 @@ fn get_chat_path() -> PathBuf {
     path.pop();
     path.push("chat_messages.json");
     path
+}
+
+/// Parses either RFC3339 ("2026-05-07T12:30:00.000Z") or local space format
+/// ("2026-05-07 14:30:00") and returns Unix milliseconds.
+fn parse_ts_millis(s: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_millis());
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Local.from_local_datetime(&ndt).single().map(|dt| dt.timestamp_millis());
+    }
+    None
+}
+
+fn append_event(event: RampEvent) {
+    let path = get_log_path();
+    let Ok(mut file) = open_state_file(&path) else { return };
+    let mut contents = String::new();
+    let _ = file.read_to_string(&mut contents);
+    let mut events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
+    events.push(event);
+    if events.len() > MAX_LOG_EVENTS {
+        let drain = events.len() - MAX_LOG_EVENTS;
+        events.drain(0..drain);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&events) {
+        let _ = file.seek(SeekFrom::Start(0));
+        let _ = file.write_all(json.as_bytes());
+        let _ = file.set_len(json.len() as u64);
+    }
+    let _ = file.unlock();
 }
 
 fn initialize_state() -> Vec<Ramp> {
@@ -173,6 +225,21 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
 
     let locked_until = Local::now().timestamp_millis() + 2000;
     if let Some(r) = ramps.iter_mut().find(|r| r.id == updated_ramp.id) {
+        // Log whenever the status actually changes
+        if r.status != updated_ramp.status {
+            let duration_min = r.last_updated_at.as_deref()
+                .and_then(parse_ts_millis)
+                .map(|old_ms| (Local::now().timestamp_millis() - old_ms) / 60_000);
+            append_event(RampEvent {
+                timestamp: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                ramp_id: updated_ramp.id,
+                from_status: r.status.clone(),
+                to_status: updated_ramp.status.clone(),
+                user: updated_ramp.last_updated_by.clone(),
+                kennzeichen: updated_ramp.kennzeichen.clone().or_else(|| r.kennzeichen.clone()),
+                duration_min,
+            });
+        }
         *r = updated_ramp;
         r.locked_until = Some(locked_until);
     }
@@ -181,6 +248,22 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
     let _ = file.unlock();
 
     Ok(ramps)
+}
+
+#[command]
+fn get_daily_log() -> Result<Vec<RampEvent>, String> {
+    let path = get_log_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let mut file = open_state_file(&path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| format!("Read error: {}", e))?;
+    let _ = file.unlock();
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let events: Vec<RampEvent> = serde_json::from_str(&contents).unwrap_or_default();
+    Ok(events.into_iter().filter(|e| e.timestamp.starts_with(&today)).collect())
 }
 
 #[command]
@@ -258,7 +341,8 @@ pub fn run() {
             get_ramps,
             update_ramp,
             get_messages,
-            send_message
+            send_message,
+            get_daily_log
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

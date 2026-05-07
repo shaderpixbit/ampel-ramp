@@ -74,6 +74,7 @@
         clockInterval = window.setInterval(() => {
             now = Date.now();
         }, 1000);
+        await fetchDailyLog();
         syncTimeout = window.setTimeout(startPolling, 1500);
     });
 
@@ -147,6 +148,7 @@
                 updatedRamp,
             });
             ramps = updatedRamps;
+            fetchDailyLog(); // refresh log after every status change
         } catch (e) {
             console.error("Failed to update ramp:", e);
             if (index !== -1 && oldRamp) ramps[index] = oldRamp;
@@ -191,9 +193,9 @@
         chatOpen = false;
     }
 
-    function getDwellTime(ramp: Ramp): string {
+    function getDwellTime(ramp: Ramp, currentTime: number): string {
         if (!ramp.last_updated_at || ramp.status === "free") return "00:00";
-        const ms = now - new Date(ramp.last_updated_at).getTime();
+        const ms = currentTime - new Date(ramp.last_updated_at).getTime();
         const totalMin = Math.max(0, Math.floor(ms / 60000));
         const h = Math.floor(totalMin / 60);
         const m = totalMin % 60;
@@ -268,7 +270,8 @@
             ...ramp,
             [field]: trimmed || null,
             last_updated_by: currentUser,
-            last_updated_at: new Date().toISOString(),
+            // last_updated_at intentionally NOT updated — it tracks when the status
+            // last changed and is the source of truth for the dwell timer
         };
         const index = ramps.findIndex((r) => r.id === ramp.id);
         const snapshot = index !== -1 ? { ...ramps[index] } : null;
@@ -279,7 +282,9 @@
         } catch (e) {
             console.error("Failed to save field:", e);
             if (index !== -1 && snapshot) ramps[index] = snapshot;
-            showError(`Rampe ${ramp.id}: Feld konnte nicht gespeichert werden.`);
+            showError(
+                `Rampe ${ramp.id}: Feld konnte nicht gespeichert werden.`,
+            );
         } finally {
             isUpdating = false;
         }
@@ -287,6 +292,61 @@
 
     function cancelFieldEdit() {
         editingField = null;
+    }
+
+    // ── Daily event log ──
+    interface RampEvent {
+        timestamp: string;
+        ramp_id: number;
+        from_status: string;
+        to_status: string;
+        user: string;
+        kennzeichen: string | null;
+        duration_min: number | null;
+    }
+
+    let dailyLog = $state<RampEvent[]>([]);
+    let showProtocol = $state(false);
+
+    // Average time (minutes) spent in any occupied state today
+    let avgDwellToday = $derived(
+        (() => {
+            const relevant = dailyLog.filter(
+                (e) => e.duration_min !== null && e.from_status !== "free",
+            );
+            if (!relevant.length) return null;
+            return Math.round(
+                relevant.reduce((s, e) => s + (e.duration_min ?? 0), 0) /
+                    relevant.length,
+            );
+        })(),
+    );
+
+    async function fetchDailyLog() {
+        try {
+            dailyLog = await invoke<RampEvent[]>("get_daily_log");
+        } catch (e) {
+            console.error("Failed to fetch daily log:", e);
+        }
+    }
+
+    function openProtocol() {
+        fetchDailyLog();
+        showProtocol = true;
+    }
+
+    function fmtStatusDE(s: string) {
+        if (s === "free") return "Frei";
+        if (s === "pending") return "Wartend";
+        return "Belegt";
+    }
+
+    function fmtDuration(min: number | null) {
+        if (min === null) return "—";
+        if (min < 60) return `${min} Min`;
+        const h = Math.floor(min / 60);
+        const m = min % 60;
+        return `${h}h ${String(m).padStart(2, "0")}m`;
     }
 
     function focusInput(node: HTMLInputElement) {
@@ -390,6 +450,20 @@
             class="w-px h-6 mx-1"
             style="background: rgba(255,255,255,0.1);"
         ></div>
+
+        <!-- Protokoll button -->
+        <button
+            onclick={openProtocol}
+            class="h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer"
+            style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
+            aria-label="Tagesprotokoll öffnen"
+        >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            Protokoll
+            {#if dailyLog.length > 0}
+                <span class="font-mono text-[10px]" style="color: rgba(255,255,255,0.45);">{dailyLog.length}</span>
+            {/if}
+        </button>
 
         <!-- Theme toggle -->
         <button
@@ -499,7 +573,7 @@
                         <span
                             class="font-mono text-[11px] uppercase tracking-[1.6px] font-medium"
                             style="color: var(--tr-text-faint);"
-                            >01 / Sektor A · Tor 30–42</span
+                            >01 / Sektor nTB · Tor 30–42</span
                         >
                         <span
                             class="w-4 h-px"
@@ -547,7 +621,7 @@
                         {@const locked = isRampLocked(ramp)}
                         {@const tone = getStatusTone(ramp.status)}
                         {@const isFree = ramp.status === "free"}
-                        {@const dwell = getDwellTime(ramp)}
+                        {@const dwell = getDwellTime(ramp, now)}
                         {@const dt = ramp.last_updated_at
                             ? new Date(ramp.last_updated_at)
                             : null}
@@ -570,7 +644,9 @@
                             class="ramp-tile relative rounded-[12px] flex flex-col gap-[9px]"
                             role="button"
                             tabindex="0"
-                            aria-label="Rampe {ramp.id}, {getStatusLabel(ramp.status)}. Enter um Status zu ändern."
+                            aria-label="Rampe {ramp.id}, {getStatusLabel(
+                                ramp.status,
+                            )}. Enter um Status zu ändern."
                             onclick={(e) => {
                                 if (
                                     (e.target as HTMLElement).closest(
@@ -858,18 +934,23 @@
                             class="font-mono text-[10px] uppercase tracking-[1.2px] font-medium"
                             style="color: var(--tr-text-faint);"
                         >
-                            Frei
+                            Ø Verweildauer heute
                         </div>
                         <div class="flex items-baseline gap-1.5">
                             <span
                                 class="font-mono text-[22px] font-semibold leading-none tabular-nums"
-                                style="color: var(--tr-text);"
-                                >{String(counts.free).padStart(2, "0")}</span
+                                style="color: {avgDwellToday !== null ? 'var(--tr-warning)' : 'var(--tr-text)'};"
                             >
+                                {avgDwellToday !== null
+                                    ? String(Math.floor(avgDwellToday / 60)).padStart(2, "0") +
+                                      ":" +
+                                      String(avgDwellToday % 60).padStart(2, "0")
+                                    : "—"}
+                            </span>
                             <span
                                 class="text-[10px] uppercase tracking-[0.6px]"
                                 style="color: var(--tr-text-faint);"
-                                >Rampen</span
+                                >{avgDwellToday !== null ? "HH:MM" : "keine Daten"}</span
                             >
                         </div>
                     </div>
@@ -1128,6 +1209,136 @@
         </aside>
     </div>
 </div>
+
+<!-- ── Tagesprotokoll Modal ── -->
+{#if showProtocol}
+    <div
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
+        onclick={(e) => { if (e.target === e.currentTarget) showProtocol = false; }}
+        onkeydown={(e) => { if (e.key === "Escape") showProtocol = false; }}
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-label="Tagesprotokoll"
+    >
+        <div
+            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+            style="width: 1100px; max-width: 95vw; max-height: 85vh; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+        >
+            <!-- Modal header -->
+            <div
+                class="flex items-center gap-4 px-6 py-4 shrink-0"
+                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
+            >
+                <div class="flex-1">
+                    <div class="text-[15px] font-semibold" style="color: #fff;">Tagesprotokoll</div>
+                    <div class="font-mono text-[10.5px] uppercase mt-[3px]"
+                         style="letter-spacing: 1.4px; color: rgba(255,255,255,0.45);">
+                        {new Date().toLocaleDateString("de-DE", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })}
+                        &nbsp;·&nbsp; {dailyLog.length} Ereignisse
+                    </div>
+                </div>
+                <button
+                    onclick={() => window.print()}
+                    class="h-8 px-4 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
+                    style="border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.8);"
+                    aria-label="Drucken"
+                >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+                    Drucken
+                </button>
+                <button
+                    onclick={() => (showProtocol = false)}
+                    aria-label="Schließen"
+                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                    style="border: 1px solid rgba(255,255,255,0.1); background: transparent; color: rgba(255,255,255,0.6);"
+                >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- Table -->
+            <div class="flex-1 overflow-auto chat-scroll">
+                {#if dailyLog.length === 0}
+                    <div class="flex flex-col items-center justify-center py-20 gap-3"
+                         style="color: var(--tr-text-faint);">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        <p class="text-sm font-medium">Noch keine Ereignisse heute</p>
+                    </div>
+                {:else}
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr style="position: sticky; top: 0; background: var(--tr-surface2); border-bottom: 1px solid var(--tr-line);">
+                                {#each ["Zeit", "Rampe", "Vorher → Nachher", "Dauer", "Fahrer", "Kennzeichen"] as col}
+                                    <th class="font-mono text-[10px] font-semibold uppercase px-4 py-3"
+                                        style="letter-spacing: 1px; color: var(--tr-text-faint); white-space: nowrap;">{col}</th>
+                                {/each}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#each [...dailyLog].reverse() as ev, i}
+                                {@const tone = getStatusTone(ev.to_status)}
+                                <tr style="border-bottom: 1px solid var(--tr-line); background: {i % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.03)'};">
+                                    <td class="px-4 py-2.5 font-mono text-[12px]" style="color: var(--tr-text-dim); white-space: nowrap;">
+                                        {new Date(ev.timestamp).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                                    </td>
+                                    <td class="px-4 py-2.5">
+                                        <span class="font-mono text-[15px] font-semibold" style="color: var(--tr-text);">{ev.ramp_id}</span>
+                                    </td>
+                                    <td class="px-4 py-2.5">
+                                        <div class="flex items-center gap-2 text-[12px]">
+                                            <span class="font-mono px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase"
+                                                  style="background: {getStatusTone(ev.from_status).bg}; color: {getStatusTone(ev.from_status).fg}; border: 1px solid {getStatusTone(ev.from_status).line};">
+                                                {fmtStatusDE(ev.from_status)}
+                                            </span>
+                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color: var(--tr-text-faint);"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                                            <span class="font-mono px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase"
+                                                  style="background: {tone.bg}; color: {tone.fg}; border: 1px solid {tone.line};">
+                                                {fmtStatusDE(ev.to_status)}
+                                            </span>
+                                        </div>
+                                    </td>
+                                    <td class="px-4 py-2.5 font-mono text-[12px]" style="color: var(--tr-text-dim);">
+                                        {fmtDuration(ev.duration_min)}
+                                    </td>
+                                    <td class="px-4 py-2.5 text-[12px]" style="color: var(--tr-text-dim);">{ev.user}</td>
+                                    <td class="px-4 py-2.5 font-mono text-[12px]"
+                                        style="color: {ev.kennzeichen ? 'var(--tr-text)' : 'var(--tr-text-faint)'};">
+                                        {ev.kennzeichen || "—"}
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+            </div>
+
+            <!-- Summary footer -->
+            {#if dailyLog.length > 0}
+                <div class="flex items-center gap-8 px-6 py-3 shrink-0"
+                     style="border-top: 1px solid var(--tr-line); background: var(--tr-surface2);">
+                    <div class="flex items-baseline gap-2">
+                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Statuswechsel</span>
+                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-text);">{dailyLog.length}</span>
+                    </div>
+                    <div class="flex items-baseline gap-2">
+                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Ø Verweildauer</span>
+                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-warning);">
+                            {avgDwellToday !== null ? fmtDuration(avgDwellToday) : "—"}
+                        </span>
+                    </div>
+                    <div class="flex items-baseline gap-2">
+                        <span class="font-mono text-[10px] uppercase font-medium" style="letter-spacing: 1px; color: var(--tr-text-faint);">Abfertigungen</span>
+                        <span class="font-mono text-[18px] font-semibold" style="color: var(--tr-green);">
+                            {dailyLog.filter((e) => e.to_status === "free").length}
+                        </span>
+                    </div>
+                </div>
+            {/if}
+        </div>
+    </div>
+{/if}
 
 <style>
     @keyframes mc-pulse {
