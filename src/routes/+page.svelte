@@ -142,9 +142,11 @@
 
     async function cycleStatus(ramp: Ramp) {
         if (isUpdating || isRampLocked(ramp)) return;
+        // Normal mode: free/pending → closed → free  (yellow bypassed in both directions)
+        // Büromodus:   free → pending → closed → free  (full 3-way cycle)
         const newStatus = isBuero
             ? cycleRampStatus(ramp.status)
-            : ramp.status === "free" ? "closed" : "free";
+            : ramp.status === "closed" ? "free" : "closed";
         const now_iso = new Date().toISOString();
         const updatedRamp: Ramp = {
             ...ramp,
