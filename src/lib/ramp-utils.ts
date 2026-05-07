@@ -9,6 +9,7 @@ export interface Ramp {
   locked_until: number | null;
   kennzeichen: string | null;
   notiz: string | null;
+  reserviert_fuer: string | null;
 }
 
 export const NEXT_STATUS: Record<RampStatus, RampStatus> = {

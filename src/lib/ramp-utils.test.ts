@@ -23,6 +23,7 @@ function makeRamp(overrides: Partial<Ramp> = {}): Ramp {
     locked_until: null,
     kennzeichen: null,
     notiz: null,
+    reserviert_fuer: null,
     ...overrides,
   };
 }

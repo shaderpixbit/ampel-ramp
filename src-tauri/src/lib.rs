@@ -10,6 +10,9 @@ const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
 const MAX_CHAT_MESSAGES: usize = 100;
 const MAX_LOG_EVENTS: usize = 500;
 
+const SECTION_A: &[u32] = &[42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30];
+const SECTION_B: &[u32] = &[57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43];
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct RampEvent {
     timestamp: String,
@@ -19,6 +22,8 @@ struct RampEvent {
     user: String,
     kennzeichen: Option<String>,
     duration_min: Option<i64>,
+    #[serde(default)]
+    reserviert_fuer: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -35,6 +40,8 @@ struct Ramp {
     kennzeichen: Option<String>,
     #[serde(default)]
     notiz: Option<String>,
+    #[serde(default)]
+    reserviert_fuer: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -104,23 +111,63 @@ fn append_event(event: RampEvent) {
     let _ = file.unlock();
 }
 
-fn initialize_state() -> Vec<Ramp> {
-    let mut ramps = Vec::new();
-    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    // Generate ramps from 42 down to 30
-    for i in (30..=42).rev() {
-        ramps.push(Ramp {
-            id: i,
-            name: format!("Ramp {}", i),
-            status: "free".to_string(),
-            last_updated_by: "System".to_string(),
-            last_updated_at: Some(now.clone()),
-            locked_until: None,
-            kennzeichen: None,
-            notiz: None,
-        });
+fn make_default_ramp(id: u32, now: &str) -> Ramp {
+    Ramp {
+        id,
+        name: format!("Ramp {}", id),
+        status: "free".to_string(),
+        last_updated_by: "System".to_string(),
+        last_updated_at: Some(now.to_string()),
+        locked_until: None,
+        kennzeichen: None,
+        notiz: None,
+        reserviert_fuer: None,
     }
-    ramps
+}
+
+fn initialize_state() -> Vec<Ramp> {
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    SECTION_A
+        .iter()
+        .chain(SECTION_B.iter())
+        .map(|&id| make_default_ramp(id, &now))
+        .collect()
+}
+
+/// Ensures the ramp list is canonical: keeps existing ramps whose IDs are in
+/// SECTION_A or SECTION_B, adds missing ones with default state, and sorts to
+/// canonical order (A then B). Returns (ramps, dirty) where dirty=true means
+/// at least one ramp was added or removed.
+fn ensure_canonical(ramps: Vec<Ramp>) -> (Vec<Ramp>, bool) {
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let all_ids: Vec<u32> = SECTION_A.iter().chain(SECTION_B.iter()).copied().collect();
+    let mut dirty = false;
+
+    // Remove ramps whose IDs are not in the canonical set
+    let before_len = ramps.len();
+    let mut canonical: Vec<Ramp> = ramps
+        .into_iter()
+        .filter(|r| all_ids.contains(&r.id))
+        .collect();
+    if canonical.len() != before_len {
+        dirty = true;
+    }
+
+    // Add any missing ramps
+    let existing_ids: Vec<u32> = canonical.iter().map(|r| r.id).collect();
+    for &id in &all_ids {
+        if !existing_ids.contains(&id) {
+            canonical.push(make_default_ramp(id, &now));
+            dirty = true;
+        }
+    }
+
+    // Sort to canonical order
+    canonical.sort_by_key(|r| {
+        all_ids.iter().position(|&id| id == r.id).unwrap_or(usize::MAX)
+    });
+
+    (canonical, dirty)
 }
 
 /// Opens the state file and acquires an exclusive lock.
@@ -148,23 +195,22 @@ fn read_state(file: &mut File) -> Result<(Vec<Ramp>, bool), String> {
     file.read_to_string(&mut contents)
         .map_err(|e| format!("Read error: {}", e))?;
 
-    let (ramps, dirty) = if contents.trim().is_empty() {
-        (initialize_state(), true)
+    let parsed = if contents.trim().is_empty() {
+        None
     } else {
         match serde_json::from_str::<Vec<Ramp>>(&contents) {
-            Ok(r) => (r, false),
+            Ok(r) => Some(r),
             Err(e) => {
                 eprintln!("Warning: corrupted JSON ({e}), reinitializing state");
-                (initialize_state(), true)
+                None
             }
         }
     };
 
-    // Auto-migrate to current ramp layout (42 down to 30, 13 ramps)
-    if ramps.len() != 13 || ramps.first().map(|r| r.id) != Some(42) {
-        eprintln!("Migrating ramp state to current layout");
-        return Ok((initialize_state(), true));
-    }
+    let (ramps, dirty) = match parsed {
+        None => (initialize_state(), true),
+        Some(r) => ensure_canonical(r),
+    };
 
     Ok((ramps, dirty))
 }
@@ -237,6 +283,7 @@ fn update_ramp(updated_ramp: Ramp) -> Result<Vec<Ramp>, String> {
                 user: updated_ramp.last_updated_by.clone(),
                 kennzeichen: updated_ramp.kennzeichen.clone().or_else(|| r.kennzeichen.clone()),
                 duration_min,
+                reserviert_fuer: updated_ramp.reserviert_fuer.clone().or_else(|| r.reserviert_fuer.clone()),
             });
         }
         *r = updated_ramp;

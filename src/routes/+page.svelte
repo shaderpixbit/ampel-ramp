@@ -55,6 +55,8 @@
         }, 4000);
     }
 
+    let bueroKeyHandler: (e: KeyboardEvent) => void;
+
     onMount(async () => {
         try {
             currentUser = await invoke("get_current_user");
@@ -76,12 +78,21 @@
         }, 1000);
         await fetchDailyLog();
         syncTimeout = window.setTimeout(startPolling, 1500);
+
+        bueroKeyHandler = (e: KeyboardEvent) => {
+            if (e.ctrlKey && e.key.toLowerCase() === "b") {
+                e.preventDefault();
+                isBuero = !isBuero;
+            }
+        };
+        window.addEventListener("keydown", bueroKeyHandler);
     });
 
     onDestroy(() => {
         clearTimeout(syncTimeout);
         clearTimeout(errorTimeout);
         clearInterval(clockInterval);
+        if (bueroKeyHandler) window.removeEventListener("keydown", bueroKeyHandler);
     });
 
     async function startPolling() {
@@ -131,14 +142,16 @@
 
     async function cycleStatus(ramp: Ramp) {
         if (isUpdating || isRampLocked(ramp)) return;
-        const newStatus = cycleRampStatus(ramp.status);
+        const newStatus = isBuero
+            ? cycleRampStatus(ramp.status)
+            : ramp.status === "free" ? "closed" : "free";
         const now_iso = new Date().toISOString();
         const updatedRamp: Ramp = {
             ...ramp,
             status: newStatus,
             last_updated_by: currentUser,
             last_updated_at: now_iso,
-            ...(newStatus === "free" && { kennzeichen: null, notiz: null }),
+            ...(newStatus === "free" && { kennzeichen: null, notiz: null, reserviert_fuer: null }),
         };
         const index = ramps.findIndex((r) => r.id === ramp.id);
         const oldRamp = index !== -1 ? { ...ramps[index] } : null;
@@ -157,6 +170,7 @@
         } finally {
             isUpdating = false;
         }
+        releaseFocus();
     }
 
     async function sendMessage() {
@@ -246,8 +260,17 @@
             : 0,
     );
 
+    let isBuero = $state(false);
+    let focusTrap: HTMLElement;
+    let rampsA = $derived([...ramps].filter(r => r.id >= 30 && r.id <= 42).sort((a, b) => b.id - a.id));
+    let rampsB = $derived([...ramps].filter(r => r.id >= 43 && r.id <= 57).sort((a, b) => b.id - a.id));
+
+    function releaseFocus() {
+        requestAnimationFrame(() => focusTrap?.focus());
+    }
+
     // ── Inline field editing ──
-    type EditField = "kennzeichen" | "notiz";
+    type EditField = "kennzeichen" | "notiz" | "reserviert_fuer";
     let editingField = $state<{
         rampId: number;
         field: EditField;
@@ -264,7 +287,10 @@
         const { field, value } = editingField;
         editingField = null;
         const trimmed = value.trim();
-        if (trimmed === (ramp[field] ?? "")) return;
+        if (trimmed === (ramp[field] ?? "")) {
+            releaseFocus();
+            return;
+        }
         const updatedRamp: Ramp = {
             ...ramp,
             [field]: trimmed || null,
@@ -287,6 +313,7 @@
         } finally {
             isUpdating = false;
         }
+        releaseFocus();
     }
 
     function cancelFieldEdit() {
@@ -464,6 +491,14 @@
             {/if}
         </button>
 
+        <!-- Büroversion badge -->
+        {#if isBuero}
+            <div class="flex items-center gap-1.5 px-3 py-1 rounded-lg font-mono text-[11px] font-semibold uppercase"
+                 style="background: rgba(218,43,41,0.2); border: 1px solid rgba(218,43,41,0.4); color: #FF6B69; letter-spacing: 1px;">
+                BÜRO · STRG+B
+            </div>
+        {/if}
+
         <!-- Theme toggle -->
         <button
             onclick={toggleMode}
@@ -565,6 +600,7 @@
     <div class="flex-1 overflow-hidden relative">
         <!-- Main scroll area -->
         <main class="h-full overflow-auto" style="padding: 22px 26px;">
+            <div bind:this={focusTrap} tabindex="-1" class="sr-only" aria-hidden="true"></div>
             <!-- Section header -->
             <div class="flex items-end justify-between mb-5 gap-6">
                 <div>
@@ -572,7 +608,7 @@
                         <span
                             class="font-mono text-[11px] uppercase tracking-[1.6px] font-medium"
                             style="color: var(--tr-text-faint);"
-                            >01 / Sektor nTB · Tor 30–42</span
+                            >Werk Hofkirchen · nTb</span
                         >
                         <span
                             class="w-4 h-px"
@@ -580,7 +616,7 @@
                         ></span>
                         <span
                             class="font-mono text-[11px] uppercase tracking-[1.6px] font-medium"
-                            style="color: var(--tr-text-faint);">13 Rampen</span
+                            style="color: var(--tr-text-faint);">{ramps.length} Rampen</span
                         >
                     </div>
                     <h1 class="text-[24px] font-semibold tracking-[-0.4px] m-0">
@@ -596,9 +632,256 @@
                         style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
                         >Klick</kbd
                     >
-                    Status · KFZ / Notiz anklicken zum Bearbeiten
+                    Status · KFZ anklicken zum Bearbeiten ·
+                    <kbd
+                        class="px-[7px] py-[2px] rounded-[5px] font-mono text-[10.5px]"
+                        style="border: 1px solid var(--tr-line); color: var(--tr-text-dim); background: var(--tr-surface);"
+                        >STRG+B</kbd
+                    >
+                    Büromodus
                 </div>
             </div>
+
+            <!-- Ramp tile snippet -->
+            {#snippet rampTile(ramp: Ramp)}
+                {@const locked = isRampLocked(ramp)}
+                {@const tone = getStatusTone(ramp.status)}
+                {@const isFree = ramp.status === "free"}
+                {@const dwellSec = (!isFree && ramp.last_updated_at)
+                    ? Math.max(0, Math.floor((now - parseTsMs(ramp.last_updated_at)) / 1000))
+                    : 0}
+                {@const dwellH = Math.floor(dwellSec / 3600)}
+                {@const dwellM = Math.floor((dwellSec % 3600) / 60)}
+                {@const dwellS = dwellSec % 60}
+                {@const dwell = dwellH > 0
+                    ? `${String(dwellH).padStart(2,"0")}:${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`
+                    : `${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`}
+                {@const dt = ramp.last_updated_at ? new Date(ramp.last_updated_at) : null}
+                {@const timeStr = dt
+                    ? dt.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })
+                    : null}
+                {@const canEdit = isConnected && !isUpdating && !locked}
+                {@const isEditKfz = editingField?.rampId === ramp.id && editingField?.field === "kennzeichen"}
+                {@const isEditRes = editingField?.rampId === ramp.id && editingField?.field === "reserviert_fuer"}
+
+                <!-- div+role avoids invalid nested-interactive HTML -->
+                <div
+                    class="ramp-tile relative rounded-[12px] flex flex-col gap-[7px]"
+                    role="button"
+                    tabindex="0"
+                    aria-label="Rampe {ramp.id}, {getStatusLabel(ramp.status)}. Enter um Status zu ändern."
+                    onclick={(e) => {
+                        if ((e.target as HTMLElement).closest("[data-field]")) return;
+                        if (canEdit) cycleStatus(ramp);
+                    }}
+                    onkeydown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            if (canEdit) cycleStatus(ramp);
+                        }
+                    }}
+                    style="
+                        padding: 10px 10px 8px;
+                        cursor: {canEdit ? 'pointer' : 'default'};
+                        background: {isFree
+                            ? 'var(--tr-surface)'
+                            : 'linear-gradient(180deg, ' + tone.bg + ' 0%, var(--tr-surface) 72%)'};
+                        border: 1px solid {isFree ? 'var(--tr-line)' : tone.line};
+                        box-shadow: {isFree ? 'none' : '0 0 24px -10px ' + tone.glow};
+                    "
+                >
+                    <!-- Lock overlay -->
+                    {#if locked}
+                        <div
+                            class="absolute inset-0 z-30 rounded-[12px] flex items-center justify-center backdrop-blur-[1px]"
+                            style="background: rgba(0,0,0,0.28);"
+                        >
+                            <LoaderCircleIcon class="w-5 h-5 animate-spin" style="color:#fff" />
+                        </div>
+                    {/if}
+
+                    <!-- Top accent stripe -->
+                    <div
+                        class="absolute top-0 left-0 right-0 h-[3px] rounded-t-[12px]"
+                        style="background: {tone.fg}; opacity: {isFree ? 0.35 : 1};"
+                    ></div>
+
+                    <!-- Row 1: number + status badge -->
+                    <div class="flex items-start justify-between gap-1.5">
+                        <div
+                            class="font-semibold leading-none tabular-nums"
+                            style="font-size: 26px; letter-spacing: -1px; color: var(--tr-text);"
+                        >
+                            {ramp.id}
+                        </div>
+                        <span
+                            class="inline-flex items-center gap-[4px] px-[6px] py-[4px] rounded-[5px] font-mono text-[9px] font-semibold uppercase tracking-[0.5px]"
+                            style="background: {tone.bg}; border: 1px solid {tone.line}; color: {tone.fg};"
+                        >
+                            <span
+                                class="w-[5px] h-[5px] rounded-full flex-shrink-0"
+                                style="background: {tone.fg}; box-shadow: {!isFree ? '0 0 5px ' + tone.glow : 'none'}; animation: {ramp.status === 'pending' ? 'mc-pulse 1.6s ease-in-out infinite' : 'none'};"
+                            ></span>
+                            {tone.label}
+                        </span>
+                    </div>
+
+                    <!-- Row 2: Kennzeichen -->
+                    <div
+                        data-field="kennzeichen"
+                        class="rounded-[4px] overflow-hidden"
+                        style="border: 1px solid {isEditKfz ? 'var(--tr-warning)' : 'var(--tr-line)'}; background: var(--tr-surface2);"
+                    >
+                        {#if isEditKfz}
+                            <div class="flex items-center gap-1 px-[7px] py-[4px]">
+                                <span
+                                    class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);">KFZ</span
+                                >
+                                <input
+                                    type="text"
+                                    class="flex-1 min-w-0 font-mono text-[11px] font-medium bg-transparent outline-none"
+                                    style="color:var(--tr-text); letter-spacing:0.5px;"
+                                    value={editingField!.value}
+                                    maxlength={15}
+                                    placeholder="z.B. M-TR 2418"
+                                    oninput={(e) => { if (editingField) editingField.value = e.currentTarget.value; }}
+                                    onblur={() => commitFieldEdit(ramp)}
+                                    onkeydown={(e) => {
+                                        if (e.key === "Enter") { e.preventDefault(); commitFieldEdit(ramp); }
+                                        if (e.key === "Escape") { e.preventDefault(); cancelFieldEdit(); }
+                                    }}
+                                    onclick={(e) => e.stopPropagation()}
+                                    use:focusInput
+                                />
+                            </div>
+                        {:else}
+                            <button
+                                class="w-full flex items-center gap-1 px-[7px] py-[4px] text-left"
+                                style="background:transparent; border:none; cursor:{canEdit ? 'text' : 'default'};"
+                                disabled={!canEdit}
+                                onclick={(e) => { e.stopPropagation(); startFieldEdit(ramp, "kennzeichen"); }}
+                                aria-label="Kennzeichen bearbeiten"
+                                tabindex="-1"
+                            >
+                                <span
+                                    class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);">KFZ</span
+                                >
+                                <span
+                                    class="font-mono text-[11px] font-medium truncate"
+                                    style="color:{ramp.kennzeichen ? 'var(--tr-text)' : 'var(--tr-text-faint)'}; letter-spacing:0.5px;"
+                                >
+                                    {ramp.kennzeichen || "— — —"}
+                                </span>
+                            </button>
+                        {/if}
+                    </div>
+
+                    <!-- Row 3: Reserviert-für (only in Büro mode or when set) -->
+                    {#if isBuero || ramp.reserviert_fuer}
+                        <div
+                            data-field="reserviert_fuer"
+                            class="rounded-[4px] overflow-hidden"
+                            style="border: 1px solid {isEditRes ? 'var(--tr-warning)' : 'var(--tr-line)'}; background: var(--tr-surface2);"
+                        >
+                            {#if isEditRes}
+                                <div class="flex items-center gap-1 px-[7px] py-[4px]">
+                                    <span
+                                        class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
+                                        style="letter-spacing:1px; color:var(--tr-text-faint);">Res.</span
+                                    >
+                                    <input
+                                        type="text"
+                                        class="flex-1 min-w-0 text-[11px] bg-transparent outline-none"
+                                        style="color:var(--tr-text);"
+                                        value={editingField!.value}
+                                        maxlength={40}
+                                        placeholder="Reserviert für…"
+                                        oninput={(e) => { if (editingField) editingField.value = e.currentTarget.value; }}
+                                        onblur={() => commitFieldEdit(ramp)}
+                                        onkeydown={(e) => {
+                                            if (e.key === "Enter") { e.preventDefault(); commitFieldEdit(ramp); }
+                                            if (e.key === "Escape") { e.preventDefault(); cancelFieldEdit(); }
+                                        }}
+                                        onclick={(e) => e.stopPropagation()}
+                                        use:focusInput
+                                    />
+                                </div>
+                            {:else if isBuero}
+                                <button
+                                    class="w-full flex items-center gap-1 px-[7px] py-[4px] text-left"
+                                    style="background:transparent; border:none; cursor:{canEdit ? 'text' : 'default'};"
+                                    disabled={!canEdit}
+                                    onclick={(e) => { e.stopPropagation(); startFieldEdit(ramp, "reserviert_fuer"); }}
+                                    aria-label="Reserviert-für bearbeiten"
+                                    tabindex="-1"
+                                >
+                                    <span
+                                        class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
+                                        style="letter-spacing:1px; color:var(--tr-text-faint);">Res.</span
+                                    >
+                                    <span
+                                        class="text-[11px] truncate"
+                                        style="color:{ramp.reserviert_fuer ? 'var(--tr-text-dim)' : 'var(--tr-text-faint)'};"
+                                    >
+                                        {ramp.reserviert_fuer || "—"}
+                                    </span>
+                                </button>
+                            {:else}
+                                <!-- Normal mode, read-only display when value is set -->
+                                <div class="flex items-center gap-1 px-[7px] py-[4px]">
+                                    <span
+                                        class="font-mono text-[8px] font-semibold uppercase flex-shrink-0"
+                                        style="letter-spacing:1px; color:var(--tr-text-faint);">Res.</span
+                                    >
+                                    <span class="text-[11px] truncate" style="color:var(--tr-text-dim);">
+                                        {ramp.reserviert_fuer}
+                                    </span>
+                                </div>
+                            {/if}
+                        </div>
+                    {/if}
+
+                    <!-- Row 4: dwell / time -->
+                    <div class="mt-auto flex justify-between items-end pt-0.5">
+                        {#if !isFree}
+                            <div>
+                                <div
+                                    class="font-mono text-[8px] uppercase mb-0.5"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                >
+                                    Verweildauer
+                                </div>
+                                <div
+                                    class="font-mono text-[14px] font-semibold leading-none tabular-nums"
+                                    style="color:{tone.fg};"
+                                >
+                                    {dwell}
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <div
+                                    class="font-mono text-[8px] uppercase mb-0.5"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                >
+                                    Seit
+                                </div>
+                                <div class="text-[11px] font-medium" style="color:var(--tr-text-dim);">
+                                    {timeStr ?? "—"}
+                                </div>
+                            </div>
+                        {:else}
+                            <div
+                                class="font-mono text-[9px]"
+                                style="color:var(--tr-text-faint); letter-spacing:0.4px;"
+                            >
+                                {timeStr ? "Frei seit " + timeStr : "Noch nie belegt"}
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+            {/snippet}
 
             <!-- Ramp grid -->
             {#if ramps.length === 0}
@@ -613,320 +896,30 @@
                     <p class="text-sm font-medium">Verbinde…</p>
                 </div>
             {:else}
-                <div
-                    style="display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px;"
-                >
-                    {#each ramps as ramp (ramp.id)}
-                        {@const locked = isRampLocked(ramp)}
-                        {@const tone = getStatusTone(ramp.status)}
-                        {@const isFree = ramp.status === "free"}
-                        {@const dwellSec = (!isFree && ramp.last_updated_at)
-                            ? Math.max(0, Math.floor((now - parseTsMs(ramp.last_updated_at)) / 1000))
-                            : 0}
-                        {@const dwellH = Math.floor(dwellSec / 3600)}
-                        {@const dwellM = Math.floor((dwellSec % 3600) / 60)}
-                        {@const dwellS = dwellSec % 60}
-                        {@const dwell = dwellH > 0
-                            ? `${String(dwellH).padStart(2,"0")}:${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`
-                            : `${String(dwellM).padStart(2,"0")}:${String(dwellS).padStart(2,"0")}`}
-                        {@const dt = ramp.last_updated_at
-                            ? new Date(ramp.last_updated_at)
-                            : null}
-                        {@const timeStr = dt
-                            ? dt.toLocaleTimeString("de-DE", {
-                                  hour: "2-digit",
-                                  minute: "2-digit",
-                              })
-                            : null}
-                        {@const canEdit = isConnected && !isUpdating && !locked}
-                        {@const isEditKfz =
-                            editingField?.rampId === ramp.id &&
-                            editingField?.field === "kennzeichen"}
-                        {@const isEditNotiz =
-                            editingField?.rampId === ramp.id &&
-                            editingField?.field === "notiz"}
+                <!-- Section A -->
+                <div class="mb-5">
+                    <div class="font-mono text-[10px] uppercase tracking-[1.6px] font-medium mb-2"
+                         style="color: var(--tr-text-faint);">
+                        01 / Sektor A · Tor 30–42 — {rampsA.length} Rampen
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;">
+                        {#each rampsA as ramp (ramp.id)}
+                            {@render rampTile(ramp)}
+                        {/each}
+                    </div>
+                </div>
 
-                        <!-- div+role avoids invalid nested-interactive HTML -->
-                        <div
-                            class="ramp-tile relative rounded-[12px] flex flex-col gap-[9px]"
-                            role="button"
-                            tabindex="0"
-                            aria-label="Rampe {ramp.id}, {getStatusLabel(
-                                ramp.status,
-                            )}. Enter um Status zu ändern."
-                            onclick={(e) => {
-                                if (
-                                    (e.target as HTMLElement).closest(
-                                        "[data-field]",
-                                    )
-                                )
-                                    return;
-                                if (canEdit) cycleStatus(ramp);
-                            }}
-                            onkeydown={(e) => {
-                                if (e.key === "Enter" || e.key === " ") {
-                                    e.preventDefault();
-                                    if (canEdit) cycleStatus(ramp);
-                                }
-                            }}
-                            style="
-                                padding: 13px 13px 11px;
-                                cursor: {canEdit ? 'pointer' : 'default'};
-                                background: {isFree
-                                ? 'var(--tr-surface)'
-                                : 'linear-gradient(180deg, ' +
-                                  tone.bg +
-                                  ' 0%, var(--tr-surface) 72%)'};
-                                border: 1px solid {isFree
-                                ? 'var(--tr-line)'
-                                : tone.line};
-                                box-shadow: {isFree
-                                ? 'none'
-                                : '0 0 24px -10px ' + tone.glow};
-                            "
-                        >
-                            <!-- Lock overlay -->
-                            {#if locked}
-                                <div
-                                    class="absolute inset-0 z-30 rounded-[12px] flex items-center justify-center backdrop-blur-[1px]"
-                                    style="background: rgba(0,0,0,0.28);"
-                                >
-                                    <LoaderCircleIcon
-                                        class="w-6 h-6 animate-spin"
-                                        style="color:#fff"
-                                    />
-                                </div>
-                            {/if}
-
-                            <!-- Top accent stripe -->
-                            <div
-                                class="absolute top-0 left-0 right-0 h-[3px] rounded-t-[12px]"
-                                style="background: {tone.fg}; opacity: {isFree
-                                    ? 0.35
-                                    : 1};"
-                            ></div>
-
-                            <!-- Row 1: number + status badge -->
-                            <div class="flex items-start justify-between gap-2">
-                                <div
-                                    class="font-semibold leading-none tabular-nums"
-                                    style="font-size: 34px; letter-spacing: -1px; color: var(--tr-text);"
-                                >
-                                    {ramp.id}
-                                </div>
-                                <span
-                                    class="inline-flex items-center gap-[5px] px-2 py-1 rounded-[6px] font-mono text-[10px] font-semibold uppercase tracking-[0.6px]"
-                                    style="background: {tone.bg}; border: 1px solid {tone.line}; color: {tone.fg};"
-                                >
-                                    <span
-                                        class="w-[6px] h-[6px] rounded-full flex-shrink-0"
-                                        style="background: {tone.fg}; box-shadow: {!isFree
-                                            ? '0 0 6px ' + tone.glow
-                                            : 'none'}; animation: {ramp.status ===
-                                        'pending'
-                                            ? 'mc-pulse 1.6s ease-in-out infinite'
-                                            : 'none'};"
-                                    ></span>
-                                    {tone.label}
-                                </span>
-                            </div>
-
-                            <!-- Row 2: Kennzeichen -->
-                            <div
-                                data-field="kennzeichen"
-                                class="rounded-[5px] overflow-hidden"
-                                style="border: 1px solid {isEditKfz
-                                    ? 'var(--tr-warning)'
-                                    : 'var(--tr-line)'}; background: var(--tr-surface2);"
-                            >
-                                {#if isEditKfz}
-                                    <div
-                                        class="flex items-center gap-1.5 px-[8px] py-[5px]"
-                                    >
-                                        <span
-                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
-                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                            >KFZ</span
-                                        >
-                                        <input
-                                            type="text"
-                                            class="flex-1 min-w-0 font-mono text-[12px] font-medium bg-transparent outline-none"
-                                            style="color:var(--tr-text); letter-spacing:0.5px;"
-                                            value={editingField!.value}
-                                            maxlength={15}
-                                            placeholder="z.B. M-TR 2418"
-                                            oninput={(e) => {
-                                                if (editingField)
-                                                    editingField.value =
-                                                        e.currentTarget.value;
-                                            }}
-                                            onblur={() => commitFieldEdit(ramp)}
-                                            onkeydown={(e) => {
-                                                if (e.key === "Enter") {
-                                                    e.preventDefault();
-                                                    commitFieldEdit(ramp);
-                                                }
-                                                if (e.key === "Escape") {
-                                                    e.preventDefault();
-                                                    cancelFieldEdit();
-                                                }
-                                            }}
-                                            onclick={(e) => e.stopPropagation()}
-                                            use:focusInput
-                                        />
-                                    </div>
-                                {:else}
-                                    <button
-                                        class="w-full flex items-center gap-1.5 px-[8px] py-[5px] text-left"
-                                        style="background:transparent; border:none; cursor:{canEdit
-                                            ? 'text'
-                                            : 'default'};"
-                                        disabled={!canEdit}
-                                        onclick={(e) => {
-                                            e.stopPropagation();
-                                            startFieldEdit(ramp, "kennzeichen");
-                                        }}
-                                        aria-label="Kennzeichen bearbeiten"
-                                        tabindex="-1"
-                                    >
-                                        <span
-                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
-                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                            >KFZ</span
-                                        >
-                                        <span
-                                            class="font-mono text-[12px] font-medium truncate"
-                                            style="color:{ramp.kennzeichen
-                                                ? 'var(--tr-text)'
-                                                : 'var(--tr-text-faint)'}; letter-spacing:0.5px;"
-                                        >
-                                            {ramp.kennzeichen || "— — —"}
-                                        </span>
-                                    </button>
-                                {/if}
-                            </div>
-
-                            <!-- Row 3: Notiz -->
-                            <div
-                                data-field="notiz"
-                                class="rounded-[5px] overflow-hidden"
-                                style="border: 1px solid {isEditNotiz
-                                    ? 'var(--tr-warning)'
-                                    : 'var(--tr-line)'}; background: var(--tr-surface2);"
-                            >
-                                {#if isEditNotiz}
-                                    <div
-                                        class="flex items-center gap-1.5 px-[8px] py-[5px]"
-                                    >
-                                        <span
-                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
-                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                            >Notiz</span
-                                        >
-                                        <input
-                                            type="text"
-                                            class="flex-1 min-w-0 text-[11px] bg-transparent outline-none"
-                                            style="color:var(--tr-text);"
-                                            value={editingField!.value}
-                                            maxlength={60}
-                                            placeholder="Kurze Notiz…"
-                                            oninput={(e) => {
-                                                if (editingField)
-                                                    editingField.value =
-                                                        e.currentTarget.value;
-                                            }}
-                                            onblur={() => commitFieldEdit(ramp)}
-                                            onkeydown={(e) => {
-                                                if (e.key === "Enter") {
-                                                    e.preventDefault();
-                                                    commitFieldEdit(ramp);
-                                                }
-                                                if (e.key === "Escape") {
-                                                    e.preventDefault();
-                                                    cancelFieldEdit();
-                                                }
-                                            }}
-                                            onclick={(e) => e.stopPropagation()}
-                                            use:focusInput
-                                        />
-                                    </div>
-                                {:else}
-                                    <button
-                                        class="w-full flex items-center gap-1.5 px-[8px] py-[5px] text-left"
-                                        style="background:transparent; border:none; cursor:{canEdit
-                                            ? 'text'
-                                            : 'default'};"
-                                        disabled={!canEdit}
-                                        onclick={(e) => {
-                                            e.stopPropagation();
-                                            startFieldEdit(ramp, "notiz");
-                                        }}
-                                        aria-label="Notiz bearbeiten"
-                                        tabindex="-1"
-                                    >
-                                        <span
-                                            class="font-mono text-[9px] font-semibold uppercase flex-shrink-0"
-                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                            >Notiz</span
-                                        >
-                                        <span
-                                            class="text-[11px] truncate"
-                                            style="color:{ramp.notiz
-                                                ? 'var(--tr-text-dim)'
-                                                : 'var(--tr-text-faint)'};"
-                                        >
-                                            {ramp.notiz || "—"}
-                                        </span>
-                                    </button>
-                                {/if}
-                            </div>
-
-                            <!-- Row 4: dwell / time -->
-                            <div
-                                class="mt-auto flex justify-between items-end pt-1"
-                            >
-                                {#if !isFree}
-                                    <div>
-                                        <div
-                                            class="font-mono text-[9px] uppercase mb-1"
-                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                        >
-                                            Verweildauer
-                                        </div>
-                                        <div
-                                            class="font-mono text-[17px] font-semibold leading-none tabular-nums"
-                                            style="color:{tone.fg};"
-                                        >
-                                            {dwell}
-                                        </div>
-                                    </div>
-                                    <div class="text-right">
-                                        <div
-                                            class="font-mono text-[9px] uppercase mb-1"
-                                            style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                        >
-                                            Seit
-                                        </div>
-                                        <div
-                                            class="text-[12px] font-medium"
-                                            style="color:var(--tr-text-dim);"
-                                        >
-                                            {timeStr ?? "—"}
-                                        </div>
-                                    </div>
-                                {:else}
-                                    <div
-                                        class="font-mono text-[10px]"
-                                        style="color:var(--tr-text-faint); letter-spacing:0.4px;"
-                                    >
-                                        {timeStr
-                                            ? "Frei seit " + timeStr
-                                            : "Noch nie belegt"}
-                                    </div>
-                                {/if}
-                            </div>
-                        </div>
-                    {/each}
+                <!-- Section B -->
+                <div>
+                    <div class="font-mono text-[10px] uppercase tracking-[1.6px] font-medium mb-2"
+                         style="color: var(--tr-text-faint);">
+                        02 / Sektor B · Tor 43–57 — {rampsB.length} Rampen
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;">
+                        {#each rampsB as ramp (ramp.id)}
+                            {@render rampTile(ramp)}
+                        {/each}
+                    </div>
                 </div>
             {/if}
 
