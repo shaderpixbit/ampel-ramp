@@ -748,6 +748,7 @@
                         if (canEdit) cycleStatus(ramp);
                     }}
                     onkeydown={(e) => {
+                        if ((e.target as HTMLElement).tagName === "INPUT") return;
                         if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
                             if (canEdit) cycleStatus(ramp);
