@@ -97,7 +97,7 @@ New users default to `member_lager`. The first user ever inserted into the `user
 
 ## Key constraints
 
-- Window is **1600×920, non-resizable** (`tauri.conf.json`). All layout decisions must fit this fixed size.
+- Window opens **maximized** with a 1600×920 baseline and is **resizable** (`tauri.conf.json`). Layout was originally built around 1600×920, so verify changes still look correct at that size as well as at larger maximized sizes.
 - No SSR — `@sveltejs/adapter-static` with `fallback: "index.html"`.
 - Bun is the package manager (use `bun` not `npm`/`pnpm`).
 - The 2-second per-ramp lock is enforced client-side via `locked_until` timestamp comparison and server-side by `update_ramp` setting a fresh `now+2000` only on status change.

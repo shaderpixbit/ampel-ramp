@@ -1368,6 +1368,27 @@
                             </div>
                         {/if}
                     </div>
+
+                    <!-- Row 5: worker -->
+                    {#if ramp.last_updated_by}
+                        <div
+                            class="flex items-baseline gap-1 pt-1 border-t"
+                            style="border-color: var(--tr-line);"
+                        >
+                            <span
+                                class="font-mono text-[8px] uppercase flex-shrink-0"
+                                style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                >Von</span
+                            >
+                            <span
+                                class="text-[11px] font-medium truncate"
+                                style="color:var(--tr-text-dim);"
+                                title={ramp.last_updated_by}
+                            >
+                                {ramp.last_updated_by}
+                            </span>
+                        </div>
+                    {/if}
                 </div>
             {/snippet}
 
