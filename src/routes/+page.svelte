@@ -9,6 +9,7 @@
         formatTime,
         formatDate,
         type Ramp,
+        type RampStatus,
     } from "$lib/ramp-utils";
     import { LoaderCircleIcon } from "@lucide/svelte";
 
@@ -149,9 +150,29 @@
             : ramp.status === "closed"
               ? "free"
               : "closed";
+        // Büro/Admin going free → pending: prompt for LKW + Reservierung first
+        if (isBuero && ramp.status === "free" && newStatus === "pending") {
+            pendingDialog = {
+                ramp,
+                kennzeichen: ramp.kennzeichen ?? "",
+                reserviert_fuer: ramp.reserviert_fuer ?? "",
+            };
+            return;
+        }
+        await applyStatusChange(ramp, newStatus);
+    }
+
+    async function applyStatusChange(
+        ramp: Ramp,
+        newStatus: RampStatus,
+        fields: Partial<
+            Pick<Ramp, "kennzeichen" | "reserviert_fuer" | "notiz">
+        > = {},
+    ) {
         const now_iso = new Date().toISOString();
         const updatedRamp: Ramp = {
             ...ramp,
+            ...fields,
             status: newStatus,
             last_updated_by: currentUser,
             last_updated_at: now_iso,
@@ -179,6 +200,21 @@
         } finally {
             isUpdating = false;
         }
+        releaseFocus();
+    }
+
+    async function confirmPendingDialog() {
+        if (!pendingDialog) return;
+        const { ramp, kennzeichen, reserviert_fuer } = pendingDialog;
+        pendingDialog = null;
+        await applyStatusChange(ramp, "pending", {
+            kennzeichen: kennzeichen.trim() || null,
+            reserviert_fuer: reserviert_fuer.trim() || null,
+        });
+    }
+
+    function cancelPendingDialog() {
+        pendingDialog = null;
         releaseFocus();
     }
 
@@ -354,6 +390,13 @@
 
     let dailyLog = $state<RampEvent[]>([]);
     let showProtocol = $state(false);
+
+    // ── Pending-status dialog (free → pending for Büro/Admin) ──
+    let pendingDialog = $state<{
+        ramp: Ramp;
+        kennzeichen: string;
+        reserviert_fuer: string;
+    } | null>(null);
 
     // ── User management ──
     interface UserEntry {
@@ -2051,6 +2094,143 @@
             >
                 Neue Benutzer erhalten automatisch die Rolle "Lager" wenn sie
                 die App zum ersten Mal öffnen.
+            </div>
+        </div>
+    </div>
+{/if}
+
+<!-- ── Pending-Status Dialog (Büro/Admin: Frei → Wartend) ── -->
+{#if pendingDialog}
+    <div
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
+        onclick={(e) => {
+            if (e.target === e.currentTarget) cancelPendingDialog();
+        }}
+        onkeydown={(e) => {
+            if (e.key === "Escape") cancelPendingDialog();
+        }}
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-label="LKW & Reservierung"
+    >
+        <div
+            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+            style="width: 460px; max-width: 96vw; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+        >
+            <!-- Header -->
+            <div
+                class="flex items-center gap-4 px-6 py-4 shrink-0"
+                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
+            >
+                <div class="flex-1">
+                    <div class="text-[15px] font-semibold" style="color:#fff;">
+                        Rampe {pendingDialog.ramp.id} · Reservierung
+                    </div>
+                    <div
+                        class="font-mono text-[10.5px] uppercase mt-[3px]"
+                        style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);"
+                    >
+                        Frei → Wartend
+                    </div>
+                </div>
+                <button
+                    onclick={cancelPendingDialog}
+                    aria-label="Schließen"
+                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                    style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);"
+                >
+                    <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        ><path d="M18 6L6 18M6 6l12 12" /></svg
+                    >
+                </button>
+            </div>
+
+            <!-- Body -->
+            <div class="flex flex-col gap-4 px-6 py-5">
+                <label class="flex flex-col gap-1.5">
+                    <span
+                        class="font-mono text-[10px] font-semibold uppercase"
+                        style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                    >
+                        LKW
+                    </span>
+                    <input
+                        type="text"
+                        class="w-full font-mono text-[13px] px-3 py-2 rounded-md outline-none"
+                        style="background:var(--tr-surface2); color:var(--tr-text); border:1px solid var(--tr-line); letter-spacing:0.5px;"
+                        maxlength={15}
+                        placeholder="z.B. M-TR 2418"
+                        value={pendingDialog.kennzeichen}
+                        oninput={(e) => {
+                            if (pendingDialog)
+                                pendingDialog.kennzeichen =
+                                    e.currentTarget.value;
+                        }}
+                        onkeydown={(e) => {
+                            if (e.key === "Enter") {
+                                e.preventDefault();
+                                confirmPendingDialog();
+                            }
+                        }}
+                        use:focusInput
+                    />
+                </label>
+                <label class="flex flex-col gap-1.5">
+                    <span
+                        class="font-mono text-[10px] font-semibold uppercase"
+                        style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                    >
+                        RES
+                    </span>
+                    <input
+                        type="text"
+                        class="w-full text-[13px] px-3 py-2 rounded-md outline-none"
+                        style="background:var(--tr-surface2); color:var(--tr-text); border:1px solid var(--tr-line);"
+                        maxlength={40}
+                        placeholder="Reserviert für…"
+                        value={pendingDialog.reserviert_fuer}
+                        oninput={(e) => {
+                            if (pendingDialog)
+                                pendingDialog.reserviert_fuer =
+                                    e.currentTarget.value;
+                        }}
+                        onkeydown={(e) => {
+                            if (e.key === "Enter") {
+                                e.preventDefault();
+                                confirmPendingDialog();
+                            }
+                        }}
+                    />
+                </label>
+            </div>
+
+            <!-- Footer -->
+            <div
+                class="flex items-center justify-end gap-2 px-6 py-4"
+                style="border-top:1px solid var(--tr-line); background:var(--tr-surface2);"
+            >
+                <button
+                    onclick={cancelPendingDialog}
+                    class="px-4 h-9 rounded-lg text-[13px] font-medium cursor-pointer"
+                    style="border:1px solid var(--tr-line); background:transparent; color:var(--tr-text);"
+                >
+                    Abbrechen
+                </button>
+                <button
+                    onclick={confirmPendingDialog}
+                    class="px-4 h-9 rounded-lg text-[13px] font-semibold cursor-pointer"
+                    style="border:1px solid var(--tr-warning); background:var(--tr-warning); color:#000;"
+                >
+                    Bestätigen
+                </button>
             </div>
         </div>
     </div>
