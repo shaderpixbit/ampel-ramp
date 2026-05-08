@@ -385,6 +385,7 @@
         to_status: string;
         user: string;
         kennzeichen: string | null;
+        reserviert_fuer: string | null;
         duration_min: number | null;
     }
 
@@ -505,6 +506,30 @@
         return { from: to, to }; // day
     }
 
+    /** Elapsed minutes from start of selected period until now — denominator for utilization %. */
+    function getPeriodMinutes(period: StatPeriod): number {
+        const now = new Date();
+        let start: Date;
+        if (period === "week") {
+            start = new Date(
+                now.getFullYear(),
+                now.getMonth(),
+                now.getDate() - 6,
+            );
+        } else if (period === "month") {
+            start = new Date(now.getFullYear(), now.getMonth(), 1);
+        } else if (period === "year") {
+            start = new Date(now.getFullYear(), 0, 1);
+        } else {
+            start = new Date(
+                now.getFullYear(),
+                now.getMonth(),
+                now.getDate(),
+            );
+        }
+        return Math.max(1, (now.getTime() - start.getTime()) / 60_000);
+    }
+
     async function fetchPeriodEvents(period: StatPeriod) {
         if (period === "day") {
             periodEvents = dailyLog;
@@ -529,7 +554,7 @@
         await fetchPeriodEvents(p);
     }
 
-    function computeStats(events: RampEvent[]) {
+    function computeStats(events: RampEvent[], period: StatPeriod) {
         const completions = events.filter((e) => e.to_status === "free").length;
         const dwellEvts = events.filter(
             (e) => e.duration_min !== null && e.from_status !== "free",
@@ -540,26 +565,147 @@
                       dwellEvts.length,
               )
             : null;
+
+        // Average waiting time: how long LKWs sat in 'pending' before status changed
+        const waitEvts = events.filter(
+            (e) => e.duration_min !== null && e.from_status === "pending",
+        );
+        const avgWait = waitEvts.length
+            ? Math.round(
+                  waitEvts.reduce((s, e) => s + (e.duration_min ?? 0), 0) /
+                      waitEvts.length,
+              )
+            : null;
+
+        // Buckets
         const byDay = new Map<string, number>();
+        const completionsByDay = new Map<string, number>();
         const byRamp = new Map<number, number>();
+        const byUser = new Map<string, number>();
+        const byHour = new Map<number, number>();
+        // Closed-minutes per ramp (numerator for utilization)
+        const closedMinByRamp = new Map<number, number>();
+
         for (const e of events) {
             const d = e.timestamp.slice(0, 10);
             byDay.set(d, (byDay.get(d) ?? 0) + 1);
+            if (e.to_status === "free") {
+                completionsByDay.set(d, (completionsByDay.get(d) ?? 0) + 1);
+            }
             byRamp.set(e.ramp_id, (byRamp.get(e.ramp_id) ?? 0) + 1);
+            byUser.set(e.user, (byUser.get(e.user) ?? 0) + 1);
+            const hour = new Date(e.timestamp).getHours();
+            if (!isNaN(hour)) {
+                byHour.set(hour, (byHour.get(hour) ?? 0) + 1);
+            }
+            if (e.from_status === "closed" && e.duration_min !== null) {
+                closedMinByRamp.set(
+                    e.ramp_id,
+                    (closedMinByRamp.get(e.ramp_id) ?? 0) + e.duration_min,
+                );
+            }
         }
+
         const topRampEntry =
             [...byRamp.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
+
+        const periodMinutes = getPeriodMinutes(period);
+        // Build a utilization map for every ramp seen in events (cap 100% — long-running closed
+        // intervals can leak across period boundaries when the closing event lands in-period).
+        const utilByRamp = new Map<number, number>();
+        for (const [id, mins] of closedMinByRamp.entries()) {
+            utilByRamp.set(
+                id,
+                Math.min(100, Math.round((mins / periodMinutes) * 100)),
+            );
+        }
+
+        // Outliers: top-3 longest waits (pending dwell) and longest occupancies (closed dwell)
+        const longestWaits = events
+            .filter((e) => e.from_status === "pending" && e.duration_min !== null)
+            .sort((a, b) => (b.duration_min ?? 0) - (a.duration_min ?? 0))
+            .slice(0, 3);
+        const longestOccupancies = events
+            .filter((e) => e.from_status === "closed" && e.duration_min !== null)
+            .sort((a, b) => (b.duration_min ?? 0) - (a.duration_min ?? 0))
+            .slice(0, 3);
+
         return {
             totalEvents: events.length,
             completions,
             avgDwell,
+            avgWait,
             byDay,
+            completionsByDay,
             byRamp,
+            byUser,
+            byHour,
+            utilByRamp,
+            closedMinByRamp,
+            periodMinutes,
             topRampEntry,
+            longestWaits,
+            longestOccupancies,
         };
     }
 
-    let periodStats = $derived(computeStats(periodEvents));
+    let periodStats = $derived(computeStats(periodEvents, statPeriod));
+
+    function exportEventsCsv() {
+        const cols = [
+            "Datum",
+            "Zeit",
+            "Rampe",
+            "Vorher",
+            "Nachher",
+            "Dauer (min)",
+            "Mitarbeiter",
+            "Kennzeichen",
+            "Reserviert für",
+        ];
+        // Excel-DE wants ; separator and CRLF; wrap fields containing ; " or newline
+        const escape = (v: string | number | null | undefined) => {
+            const s = v === null || v === undefined ? "" : String(v);
+            return /[";\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        };
+        const rows = periodEvents.map((e) => {
+            const d = new Date(e.timestamp);
+            const date = e.timestamp.slice(0, 10);
+            const time = isNaN(d.getTime())
+                ? e.timestamp.slice(11, 19)
+                : d.toLocaleTimeString("de-DE", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                  });
+            return [
+                date,
+                time,
+                e.ramp_id,
+                fmtStatusDE(e.from_status),
+                fmtStatusDE(e.to_status),
+                e.duration_min ?? "",
+                e.user,
+                e.kennzeichen ?? "",
+                e.reserviert_fuer ?? "",
+            ]
+                .map(escape)
+                .join(";");
+        });
+        // BOM so Excel auto-detects UTF-8
+        const csv = "﻿" + [cols.join(";"), ...rows].join("\r\n");
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+        const { from, to } = getPeriodDates(statPeriod);
+        const fname = `ramp-protokoll_${from}_bis_${to}.csv`;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
 
     function focusInput(node: HTMLInputElement) {
         node.focus();
@@ -1573,15 +1719,25 @@
 {#if showProtocol}
     {@const stats = periodStats}
     {@const dayEntries = [...periodEvents].reverse()}
-    {@const dayMap = [...stats.byDay.entries()].sort((a, b) =>
+    {@const dayMap = [...stats.completionsByDay.entries()].sort((a, b) =>
         a[0].localeCompare(b[0]),
     )}
     {@const maxDayCount = dayMap.length
         ? Math.max(...dayMap.map(([, n]) => n))
         : 1}
     {@const topRamps = [...stats.byRamp.entries()]
+        .map(([id, count]) =>
+            [id, count, stats.utilByRamp.get(id) ?? 0] as [number, number, number],
+        )
         .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)}
+        .slice(0, 8)}
+    {@const userRows = [...stats.byUser.entries()].sort(
+        (a, b) => b[1] - a[1],
+    )}
+    {@const hourRows = Array.from({ length: 24 }, (_, h) =>
+        [h, stats.byHour.get(h) ?? 0] as [number, number],
+    )}
+    {@const maxHourCount = Math.max(1, ...hourRows.map(([, n]) => n))}
     <div
         class="fixed inset-0 z-50 flex items-center justify-center"
         style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
@@ -1643,6 +1799,31 @@
                     {/each}
                 </div>
                 <button
+                    onclick={exportEventsCsv}
+                    disabled={periodEvents.length === 0}
+                    aria-label="Als CSV exportieren"
+                    class="h-8 px-3 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                    style="border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.8);"
+                >
+                    <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        ><path
+                            d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"
+                        /><polyline points="7 10 12 15 17 10" /><line
+                            x1="12"
+                            y1="15"
+                            x2="12"
+                            y2="3"
+                        /></svg
+                    >
+                    CSV
+                </button>
+                <button
                     onclick={() => window.print()}
                     aria-label="Drucken"
                     class="h-8 px-3 rounded-lg flex items-center gap-2 text-[12px] font-medium cursor-pointer"
@@ -1680,10 +1861,10 @@
 
             <!-- Summary strip -->
             <div
-                class="flex gap-6 px-6 py-3 shrink-0"
+                class="flex flex-wrap gap-x-6 gap-y-3 px-6 py-3 shrink-0"
                 style="border-bottom:1px solid var(--tr-line); background:var(--tr-surface2);"
             >
-                {#each [{ label: "Statuswechsel", value: String(stats.totalEvents), color: "var(--tr-text)" }, { label: "Abfertigungen", value: String(stats.completions), color: "var(--tr-green)" }, { label: "Ø Verweildauer", value: stats.avgDwell !== null ? fmtDuration(stats.avgDwell) : "—", color: "var(--tr-warning)" }, { label: "Aktivste Rampe", value: stats.topRampEntry ? `Rampe ${stats.topRampEntry[0]} (${stats.topRampEntry[1]}×)` : "—", color: "var(--tr-text)" }] as s}
+                {#each [{ label: "Statuswechsel", value: String(stats.totalEvents), color: "var(--tr-text)" }, { label: "Abfertigungen", value: String(stats.completions), color: "var(--tr-green)" }, { label: "Ø Wartezeit", value: stats.avgWait !== null ? fmtDuration(stats.avgWait) : "—", color: "var(--tr-red)" }, { label: "Ø Verweildauer", value: stats.avgDwell !== null ? fmtDuration(stats.avgDwell) : "—", color: "var(--tr-warning)" }, { label: "Aktivste Rampe", value: stats.topRampEntry ? `Rampe ${stats.topRampEntry[0]} (${stats.topRampEntry[1]}×)` : "—", color: "var(--tr-text)" }] as s}
                     <div class="flex flex-col gap-0.5">
                         <div
                             class="font-mono text-[10px] uppercase font-medium"
@@ -1715,7 +1896,59 @@
 
             <!-- Body: trend + table -->
             <div class="flex-1 overflow-auto chat-scroll flex flex-col">
-                <!-- Daily trend bars (hidden for Tag view) -->
+                <!-- Hour-of-day heatmap (always shown when events exist) -->
+                {#if stats.totalEvents > 0}
+                    <div
+                        class="px-6 py-4 shrink-0"
+                        style="border-bottom:1px solid var(--tr-line);"
+                    >
+                        <div
+                            class="font-mono text-[10px] uppercase font-medium mb-3 flex items-center justify-between"
+                            style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                        >
+                            <span>Aktivität nach Tagesstunde</span>
+                            <span style="text-transform:none; letter-spacing:0;">
+                                Peak: {hourRows.reduce(
+                                    (best, [h, n]) => (n > best[1] ? [h, n] : best),
+                                    [0, 0] as [number, number],
+                                )[0]}:00 Uhr
+                            </span>
+                        </div>
+                        <div class="flex items-end gap-[3px]" style="height:52px;">
+                            {#each hourRows as [hour, count]}
+                                {@const pct =
+                                    maxHourCount > 0
+                                        ? (count / maxHourCount) * 100
+                                        : 0}
+                                <div
+                                    class="flex flex-col items-center gap-1 flex-1 min-w-0"
+                                    title="{String(hour).padStart(2, '0')}:00 — {count} Ereignisse"
+                                >
+                                    <div
+                                        class="w-full rounded-t-[2px]"
+                                        style="height:{Math.max(
+                                            count > 0 ? 4 : 1,
+                                            pct * 0.42,
+                                        )}px; background:{count > 0
+                                            ? 'var(--tr-warning)'
+                                            : 'var(--tr-line)'}; opacity:{count >
+                                        0
+                                            ? 0.85
+                                            : 0.4};"
+                                    ></div>
+                                    <div
+                                        class="font-mono text-[8px]"
+                                        style="color:var(--tr-text-faint); white-space:nowrap;"
+                                    >
+                                        {String(hour).padStart(2, "0")}
+                                    </div>
+                                </div>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+
+                <!-- Completions per day trend (hidden for Tag view) -->
                 {#if statPeriod !== "day" && dayMap.length > 0}
                     <div
                         class="px-6 py-4 shrink-0"
@@ -1725,7 +1958,7 @@
                             class="font-mono text-[10px] uppercase font-medium mb-3"
                             style="letter-spacing:1.2px; color:var(--tr-text-faint);"
                         >
-                            Verlauf
+                            Abfertigungen pro Tag
                         </div>
                         <div class="flex items-end gap-1" style="height:52px;">
                             {#each dayMap as [day, count]}
@@ -1735,15 +1968,23 @@
                                         : 0}
                                 <div
                                     class="flex flex-col items-center gap-1 flex-1 min-w-0"
-                                    title="{day}: {count}"
+                                    title="{day}: {count} Abfertigungen"
                                 >
                                     <div
-                                        class="w-full rounded-t-[2px]"
+                                        class="w-full rounded-t-[2px] flex items-start justify-center"
                                         style="height:{Math.max(
                                             4,
                                             pct * 0.48,
-                                        )}px; background:var(--tr-green); opacity:0.7;"
-                                    ></div>
+                                        )}px; background:var(--tr-green); opacity:0.75;"
+                                    >
+                                        {#if dayMap.length <= 14 && count > 0 && pct > 35}
+                                            <span
+                                                class="font-mono text-[8px] font-semibold mt-[1px]"
+                                                style="color:#fff;"
+                                                >{count}</span
+                                            >
+                                        {/if}
+                                    </div>
                                     {#if dayMap.length <= 14}
                                         <div
                                             class="font-mono text-[8px]"
@@ -1758,8 +1999,8 @@
                     </div>
                 {/if}
 
-                <!-- Top ramps (hidden for Tag view) -->
-                {#if statPeriod !== "day" && topRamps.length > 0}
+                <!-- Top ramps with utilization % (always shown when there are events) -->
+                {#if topRamps.length > 0}
                     <div
                         class="px-6 py-4 shrink-0"
                         style="border-bottom:1px solid var(--tr-line);"
@@ -1768,10 +2009,10 @@
                             class="font-mono text-[10px] uppercase font-medium mb-3"
                             style="letter-spacing:1.2px; color:var(--tr-text-faint);"
                         >
-                            Aktivität pro Rampe (Top 5)
+                            Aktivität & Auslastung pro Rampe (Top 8)
                         </div>
                         <div class="flex flex-col gap-2">
-                            {#each topRamps as [id, count]}
+                            {#each topRamps as [id, count, util]}
                                 {@const pct =
                                     stats.byRamp.size > 0
                                         ? (count / (topRamps[0][1] || 1)) * 100
@@ -1793,13 +2034,192 @@
                                         ></div>
                                     </div>
                                     <div
-                                        class="font-mono text-[11px] w-8 text-right"
+                                        class="font-mono text-[11px] w-12 text-right"
                                         style="color:var(--tr-text-dim);"
                                     >
-                                        {count}
+                                        {count}×
+                                    </div>
+                                    <div
+                                        class="font-mono text-[11px] font-semibold w-12 text-right"
+                                        style="color:{util >= 70
+                                            ? 'var(--tr-red)'
+                                            : util >= 40
+                                              ? 'var(--tr-warning)'
+                                              : 'var(--tr-text-dim)'};"
+                                        title="Auslastung (Belegt-Zeit ÷ Periodendauer)"
+                                    >
+                                        {util}%
                                     </div>
                                 </div>
                             {/each}
+                        </div>
+                    </div>
+                {/if}
+
+                <!-- Per-employee activity + outliers (side by side) -->
+                {#if stats.totalEvents > 0}
+                    <div
+                        class="grid gap-0 shrink-0"
+                        style="grid-template-columns:1fr 1fr; border-bottom:1px solid var(--tr-line);"
+                    >
+                        <!-- Employee activity -->
+                        <div
+                            class="px-6 py-4"
+                            style="border-right:1px solid var(--tr-line);"
+                        >
+                            <div
+                                class="font-mono text-[10px] uppercase font-medium mb-3"
+                                style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                            >
+                                Aktivität pro Mitarbeiter
+                            </div>
+                            {#if userRows.length === 0}
+                                <div
+                                    class="text-[12px]"
+                                    style="color:var(--tr-text-faint);"
+                                >
+                                    —
+                                </div>
+                            {:else}
+                                {@const maxUser = userRows[0][1]}
+                                <div class="flex flex-col gap-1.5">
+                                    {#each userRows.slice(0, 8) as [user, count]}
+                                        {@const pct = (count / maxUser) * 100}
+                                        <div class="flex items-center gap-3">
+                                            <div
+                                                class="text-[11px] truncate"
+                                                style="color:var(--tr-text); width:120px;"
+                                                title={user}
+                                            >
+                                                {user}
+                                            </div>
+                                            <div
+                                                class="flex-1 rounded-full overflow-hidden"
+                                                style="height:5px; background:var(--tr-line);"
+                                            >
+                                                <div
+                                                    class="h-full rounded-full"
+                                                    style="width:{pct}%; background:var(--tr-text-dim);"
+                                                ></div>
+                                            </div>
+                                            <div
+                                                class="font-mono text-[11px] w-8 text-right"
+                                                style="color:var(--tr-text-dim);"
+                                            >
+                                                {count}
+                                            </div>
+                                        </div>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </div>
+
+                        <!-- Outliers: longest waits + longest occupancies -->
+                        <div class="px-6 py-4 flex flex-col gap-3">
+                            <div>
+                                <div
+                                    class="font-mono text-[10px] uppercase font-medium mb-2"
+                                    style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                                >
+                                    Längste Wartezeiten
+                                </div>
+                                {#if stats.longestWaits.length === 0}
+                                    <div
+                                        class="text-[12px]"
+                                        style="color:var(--tr-text-faint);"
+                                    >
+                                        —
+                                    </div>
+                                {:else}
+                                    <div class="flex flex-col gap-1">
+                                        {#each stats.longestWaits as ev}
+                                            <div
+                                                class="flex items-center gap-3 text-[11px]"
+                                            >
+                                                <div
+                                                    class="font-mono font-semibold w-14 shrink-0"
+                                                    style="color:var(--tr-red);"
+                                                >
+                                                    {fmtDuration(
+                                                        ev.duration_min,
+                                                    )}
+                                                </div>
+                                                <div
+                                                    class="font-mono w-14 shrink-0"
+                                                    style="color:var(--tr-text);"
+                                                >
+                                                    R {ev.ramp_id}
+                                                </div>
+                                                <div
+                                                    class="font-mono shrink-0"
+                                                    style="color:var(--tr-text-dim); width:90px;"
+                                                >
+                                                    {ev.kennzeichen || "—"}
+                                                </div>
+                                                <div
+                                                    class="truncate"
+                                                    style="color:var(--tr-text-faint);"
+                                                    title={ev.user}
+                                                >
+                                                    {ev.user}
+                                                </div>
+                                            </div>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            </div>
+                            <div>
+                                <div
+                                    class="font-mono text-[10px] uppercase font-medium mb-2"
+                                    style="letter-spacing:1.2px; color:var(--tr-text-faint);"
+                                >
+                                    Längste Belegungen
+                                </div>
+                                {#if stats.longestOccupancies.length === 0}
+                                    <div
+                                        class="text-[12px]"
+                                        style="color:var(--tr-text-faint);"
+                                    >
+                                        —
+                                    </div>
+                                {:else}
+                                    <div class="flex flex-col gap-1">
+                                        {#each stats.longestOccupancies as ev}
+                                            <div
+                                                class="flex items-center gap-3 text-[11px]"
+                                            >
+                                                <div
+                                                    class="font-mono font-semibold w-14 shrink-0"
+                                                    style="color:var(--tr-warning);"
+                                                >
+                                                    {fmtDuration(
+                                                        ev.duration_min,
+                                                    )}
+                                                </div>
+                                                <div
+                                                    class="font-mono w-14 shrink-0"
+                                                    style="color:var(--tr-text);"
+                                                >
+                                                    R {ev.ramp_id}
+                                                </div>
+                                                <div
+                                                    class="font-mono shrink-0"
+                                                    style="color:var(--tr-text-dim); width:90px;"
+                                                >
+                                                    {ev.kennzeichen || "—"}
+                                                </div>
+                                                <div
+                                                    class="truncate"
+                                                    style="color:var(--tr-text-faint);"
+                                                    title={ev.user}
+                                                >
+                                                    {ev.user}
+                                                </div>
+                                            </div>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            </div>
                         </div>
                     </div>
                 {/if}
