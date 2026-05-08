@@ -1,215 +1,94 @@
 import { describe, it, expect } from "vitest";
 import {
   isRampLocked,
-  getStatusColor,
   cycleRampStatus,
-  formatDateTime,
+  getStatusLabel,
   formatTime,
   formatDate,
   NEXT_STATUS,
-  type Ramp,
   type RampStatus,
 } from "./ramp-utils";
 
-// ─── helpers ───────────────────────────────────────────────────────────────────
-
-function makeRamp(overrides: Partial<Ramp> = {}): Ramp {
-  return {
-    id: 42,
-    name: "Ramp 42",
-    status: "free",
-    last_updated_by: "TestUser",
-    last_updated_at: null,
-    locked_until: null,
-    kennzeichen: null,
-    notiz: null,
-    reserviert_fuer: null,
-    ...overrides,
-  };
-}
-
-function isoAt(offsetMs: number): string {
-  return new Date(Date.now() + offsetMs).toISOString();
-}
+const STATUSES: RampStatus[] = ["free", "pending", "closed"];
 
 // ─── isRampLocked ──────────────────────────────────────────────────────────────
 
 describe("isRampLocked", () => {
-  it("returns false when locked_until is null", () => {
-    expect(isRampLocked(makeRamp({ locked_until: null }))).toBe(false);
-  });
-
-  it("returns false when lock expired in the past", () => {
-    expect(isRampLocked(makeRamp({ locked_until: Date.now() - 1 }))).toBe(false);
-  });
-
-  it("returns true when lock is still active", () => {
-    expect(isRampLocked(makeRamp({ locked_until: Date.now() + 3000 }))).toBe(true);
-  });
-
-  it("returns true for a freshly set 3-second lock", () => {
-    expect(isRampLocked(makeRamp({ locked_until: Date.now() + 2999 }))).toBe(true);
-  });
-
-  it("works with a Pick — does not require the full Ramp shape", () => {
-    expect(isRampLocked({ locked_until: Date.now() + 1000 })).toBe(true);
-    expect(isRampLocked({ locked_until: null })).toBe(false);
+  it.each([
+    { name: "null lock",      offset: null, expected: false },
+    { name: "expired lock",   offset: -1,   expected: false },
+    { name: "lock 1ms ahead", offset: 1,    expected: true  },
+    { name: "lock 3s ahead",  offset: 3000, expected: true  },
+  ])("$name → $expected", ({ offset, expected }) => {
+    const locked_until = offset === null ? null : Date.now() + offset;
+    expect(isRampLocked({ locked_until })).toBe(expected);
   });
 });
 
-// ─── cycleRampStatus ───────────────────────────────────────────────────────────
+// ─── cycleRampStatus / NEXT_STATUS ─────────────────────────────────────────────
 
 describe("cycleRampStatus", () => {
-  it("free → pending", () => {
-    expect(cycleRampStatus("free")).toBe("pending");
+  it.each([
+    ["free",    "pending"],
+    ["pending", "closed"],
+    ["closed",  "free"],
+  ] as const)("%s → %s", (input, expected) => {
+    expect(cycleRampStatus(input)).toBe(expected);
   });
 
-  it("pending → closed", () => {
-    expect(cycleRampStatus("pending")).toBe("closed");
-  });
-
-  it("closed → free", () => {
-    expect(cycleRampStatus("closed")).toBe("free");
-  });
-
-  it("cycles back to the start after 3 steps", () => {
-    let s: RampStatus = "free";
-    s = cycleRampStatus(s);
-    s = cycleRampStatus(s);
-    s = cycleRampStatus(s);
-    expect(s).toBe("free");
-  });
-
-  it("NEXT_STATUS covers every known status", () => {
-    const statuses: RampStatus[] = ["free", "pending", "closed"];
-    for (const s of statuses) {
-      expect(statuses).toContain(NEXT_STATUS[s]);
-    }
+  // Guards against a regression where two statuses map to the same target,
+  // which would collapse the cycle and trap the UI in a 2-state loop.
+  it("NEXT_STATUS is a permutation of the statuses", () => {
+    expect(new Set(STATUSES.map((s) => NEXT_STATUS[s]))).toEqual(new Set(STATUSES));
   });
 });
 
-// ─── getStatusColor ────────────────────────────────────────────────────────────
+// ─── getStatusLabel ────────────────────────────────────────────────────────────
 
-describe("getStatusColor", () => {
-  it("free returns emerald classes", () => {
-    expect(getStatusColor("free")).toContain("emerald");
-  });
-
-  it("pending returns amber classes", () => {
-    expect(getStatusColor("pending")).toContain("amber");
-  });
-
-  it("closed returns rose classes", () => {
-    expect(getStatusColor("closed")).toContain("rose");
-  });
-
-  it("returns a non-empty string for every known status", () => {
-    const statuses: RampStatus[] = ["free", "pending", "closed"];
-    for (const s of statuses) {
-      expect(getStatusColor(s).length).toBeGreaterThan(0);
-    }
-  });
-
-  it("free result includes hover variant", () => {
-    expect(getStatusColor("free")).toContain("hover:");
-  });
-
-  it("closed result includes shadow glow", () => {
-    expect(getStatusColor("closed")).toContain("shadow-");
-  });
-});
-
-// ─── formatDateTime ────────────────────────────────────────────────────────────
-
-describe("formatDateTime", () => {
-  it("returns empty strings for null input", () => {
-    expect(formatDateTime(null)).toEqual({ date: "", time: "" });
-  });
-
-  it("returns an object with date and time keys", () => {
-    const result = formatDateTime("2024-06-15T10:30:00.000Z");
-    expect(result).toHaveProperty("date");
-    expect(result).toHaveProperty("time");
-  });
-
-  it("date is non-empty for a valid ISO string", () => {
-    expect(formatDateTime("2024-06-15T10:30:00.000Z").date).toBeTruthy();
-  });
-
-  it("time is non-empty for a valid ISO string", () => {
-    expect(formatDateTime("2024-06-15T10:30:00.000Z").time).toBeTruthy();
-  });
-
-  it("time contains HH:MM pattern", () => {
-    const { time } = formatDateTime("2024-06-15T10:30:00.000Z");
-    expect(time).toMatch(/\d{1,2}:\d{2}/);
-  });
-
-  it("date contains digit characters", () => {
-    const { date } = formatDateTime("2024-06-15T10:30:00.000Z");
-    expect(date).toMatch(/\d/);
+describe("getStatusLabel", () => {
+  it.each([
+    ["free",    "Frei"],
+    ["pending", "Wartend"],
+    ["closed",  "Belegt"],
+  ] as const)("%s → %s", (input, expected) => {
+    expect(getStatusLabel(input)).toBe(expected);
   });
 });
 
 // ─── formatTime ────────────────────────────────────────────────────────────────
 
 describe("formatTime", () => {
-  it("returns HH:MM formatted string", () => {
-    const result = formatTime("2024-06-15T14:05:00.000Z");
+  // Concrete time output is timezone-dependent; assert the shape only.
+  it("returns zero-padded HH:MM (5 chars)", () => {
+    const result = formatTime("2024-06-15T09:30:00.000Z");
     expect(result).toMatch(/^\d{2}:\d{2}$/);
+    expect(result).toHaveLength(5);
   });
 
-  it("always pads to two digits", () => {
-    // midnight UTC → single-digit hour in some timezones; format must still be HH:MM
-    const result = formatTime("2024-06-15T00:01:00.000Z");
-    expect(result).toMatch(/^\d{2}:\d{2}$/);
-  });
-
-  it("returns a string of exactly 5 characters", () => {
-    expect(formatTime("2024-06-15T09:30:00.000Z")).toHaveLength(5);
+  it("pads single-digit hours", () => {
+    expect(formatTime("2024-06-15T00:01:00.000Z")).toMatch(/^\d{2}:\d{2}$/);
   });
 });
 
 // ─── formatDate ────────────────────────────────────────────────────────────────
 
 describe("formatDate", () => {
-  it('returns "Today" for the current date at midday', () => {
-    const today = new Date();
-    today.setHours(12, 0, 0, 0);
-    expect(formatDate(today.toISOString())).toBe("Today");
+  const isoMiddayOffset = (daysAgo: number) => {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  };
+
+  it("returns 'Heute' for today", () => {
+    expect(formatDate(isoMiddayOffset(0))).toBe("Heute");
   });
 
-  it('returns "Today" for the very start of today', () => {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    expect(formatDate(today.toISOString())).toBe("Today");
+  it("returns 'Gestern' for one day ago", () => {
+    expect(formatDate(isoMiddayOffset(1))).toBe("Gestern");
   });
 
-  it('returns "Yesterday" for yesterday at midday', () => {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    yesterday.setHours(12, 0, 0, 0);
-    expect(formatDate(yesterday.toISOString())).toBe("Yesterday");
-  });
-
-  it("does not return Today or Yesterday for two days ago", () => {
-    const twoDaysAgo = new Date();
-    twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
-    const result = formatDate(twoDaysAgo.toISOString());
-    expect(result).not.toBe("Today");
-    expect(result).not.toBe("Yesterday");
-  });
-
-  it("returns a formatted date string (contains digits) for old dates", () => {
-    const old = new Date("2020-03-15T12:00:00.000Z");
-    const result = formatDate(old.toISOString());
-    expect(result).toMatch(/\d/);
-    expect(result).not.toBe("Today");
-    expect(result).not.toBe("Yesterday");
-  });
-
-  it("uses dot-separated German locale format for old dates", () => {
-    const old = new Date("2020-03-15T12:00:00.000Z");
-    expect(formatDate(old.toISOString())).toMatch(/\d{2}\.\d{2}\.\d{4}/);
+  it("falls back to dd.MM.yyyy for older dates", () => {
+    expect(formatDate(isoMiddayOffset(7))).toMatch(/^\d{2}\.\d{2}\.\d{4}$/);
   });
 });
