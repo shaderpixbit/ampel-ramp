@@ -19,12 +19,19 @@
         timestamp: string;
     }
 
+    interface StatePayload {
+        version: number;
+        ramps: Ramp[] | null;
+        messages: ChatMessage[] | null;
+    }
+
     let ramps = $state<Ramp[]>([]);
     let currentUser = $state("Unknown User");
     let syncTimeout: number;
     let isUpdating = $state(false);
     let isConnected = $state(true);
     let isFetching = false;
+    let lastVersion: number | null = null;
     let syncError = $state<string | null>(null);
     let errorTimeout: number;
 
@@ -93,16 +100,14 @@
         if (!isUpdating && !isFetching) {
             isFetching = true;
             try {
-                const [dbRamps, dbMessages] = await Promise.all([
-                    invoke<Ramp[]>("get_ramps"),
-                    invoke<ChatMessage[]>("get_messages"),
-                ]);
+                const payload = await invoke<StatePayload>("get_state", {
+                    sinceVersion: lastVersion,
+                });
 
-                if (JSON.stringify(ramps) !== JSON.stringify(dbRamps))
-                    ramps = dbRamps;
+                if (payload.ramps !== null) ramps = payload.ramps;
 
-                if (JSON.stringify(messages) !== JSON.stringify(dbMessages)) {
-                    messages = dbMessages;
+                if (payload.messages !== null) {
+                    messages = payload.messages;
                     if (chatOpen) {
                         lastReadCount = messages.length;
                         await tick();
@@ -111,6 +116,7 @@
                     }
                 }
 
+                lastVersion = payload.version;
                 isConnected = true;
             } catch (e) {
                 console.error("Failed to fetch state from network drive:", e);
@@ -164,6 +170,7 @@
                 updatedRamp,
             });
             ramps = updatedRamps;
+            lastVersion = null; // resync version cursor on next poll
             fetchDailyLog(); // refresh log after every status change
         } catch (e) {
             console.error("Failed to update ramp:", e);
@@ -186,6 +193,7 @@
                 text,
             });
             messages = updated;
+            lastVersion = null; // resync version cursor on next poll
             lastReadCount = messages.length;
             await tick();
             if (chatScrollEl)
@@ -316,6 +324,7 @@
         isUpdating = true;
         try {
             ramps = await invoke("update_ramp", { updatedRamp });
+            lastVersion = null; // resync version cursor on next poll
         } catch (e) {
             console.error("Failed to save field:", e);
             if (index !== -1 && snapshot) ramps[index] = snapshot;
@@ -373,6 +382,7 @@
             allUsers = allUsers.map((u) =>
                 u.username === username ? { ...u, role: newRole } : u,
             );
+            if (username === currentUser) userRole = newRole;
         } catch (e) {
             console.error("Failed to set user role:", e);
             showError("Rolle konnte nicht gesetzt werden.");
@@ -836,7 +846,7 @@
 
             <!-- Ramp tile snippet -->
             {#snippet rampTile(ramp: Ramp)}
-                {@const locked = isRampLocked(ramp)}
+                {@const locked = !!ramp.locked_until && ramp.locked_until > now}
                 {@const tone = getStatusTone(ramp.status)}
                 {@const isFree = ramp.status === "free"}
                 {@const dwellSec =
