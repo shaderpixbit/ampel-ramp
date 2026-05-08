@@ -1,6 +1,8 @@
 <script lang="ts">
     import { onMount, onDestroy, tick } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
+    import { save } from "@tauri-apps/plugin-dialog";
+    import { writeTextFile } from "@tauri-apps/plugin-fs";
     import { toggleMode } from "mode-watcher";
     import {
         isRampLocked,
@@ -159,7 +161,24 @@
             };
             return;
         }
+        // Belegt → Frei: confirm release before clearing the ramp
+        if (ramp.status === "closed" && newStatus === "free") {
+            releaseDialog = { ramp };
+            return;
+        }
         await applyStatusChange(ramp, newStatus);
+    }
+
+    async function confirmReleaseDialog() {
+        if (!releaseDialog) return;
+        const { ramp } = releaseDialog;
+        releaseDialog = null;
+        await applyStatusChange(ramp, "free");
+    }
+
+    function cancelReleaseDialog() {
+        releaseDialog = null;
+        releaseFocus();
     }
 
     async function applyStatusChange(
@@ -399,6 +418,9 @@
         reserviert_fuer: string;
     } | null>(null);
 
+    // ── Release dialog (closed → free, all roles) ──
+    let releaseDialog = $state<{ ramp: Ramp } | null>(null);
+
     // ── User management ──
     interface UserEntry {
         username: string;
@@ -521,11 +543,7 @@
         } else if (period === "year") {
             start = new Date(now.getFullYear(), 0, 1);
         } else {
-            start = new Date(
-                now.getFullYear(),
-                now.getMonth(),
-                now.getDate(),
-            );
+            start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
         }
         return Math.max(1, (now.getTime() - start.getTime()) / 60_000);
     }
@@ -622,11 +640,15 @@
 
         // Outliers: top-3 longest waits (pending dwell) and longest occupancies (closed dwell)
         const longestWaits = events
-            .filter((e) => e.from_status === "pending" && e.duration_min !== null)
+            .filter(
+                (e) => e.from_status === "pending" && e.duration_min !== null,
+            )
             .sort((a, b) => (b.duration_min ?? 0) - (a.duration_min ?? 0))
             .slice(0, 3);
         const longestOccupancies = events
-            .filter((e) => e.from_status === "closed" && e.duration_min !== null)
+            .filter(
+                (e) => e.from_status === "closed" && e.duration_min !== null,
+            )
             .sort((a, b) => (b.duration_min ?? 0) - (a.duration_min ?? 0))
             .slice(0, 3);
 
@@ -651,7 +673,7 @@
 
     let periodStats = $derived(computeStats(periodEvents, statPeriod));
 
-    function exportEventsCsv() {
+    async function exportEventsCsv() {
         const cols = [
             "Datum",
             "Zeit",
@@ -694,17 +716,19 @@
         });
         // BOM so Excel auto-detects UTF-8
         const csv = "﻿" + [cols.join(";"), ...rows].join("\r\n");
-        const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
         const { from, to } = getPeriodDates(statPeriod);
         const fname = `ramp-protokoll_${from}_bis_${to}.csv`;
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = fname;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 0);
+        try {
+            const path = await save({
+                defaultPath: fname,
+                filters: [{ name: "CSV", extensions: ["csv"] }],
+            });
+            if (!path) return; // user cancelled
+            await writeTextFile(path, csv);
+        } catch (e) {
+            console.error("CSV export failed:", e);
+            showError("CSV-Export fehlgeschlagen.");
+        }
     }
 
     function focusInput(node: HTMLInputElement) {
@@ -1378,8 +1402,7 @@
                             <span
                                 class="font-mono text-[8px] uppercase flex-shrink-0"
                                 style="letter-spacing:1px; color:var(--tr-text-faint);"
-                                >Von</span
-                            >
+                            ></span>
                             <span
                                 class="text-[11px] font-medium truncate"
                                 style="color:var(--tr-text-dim);"
@@ -1747,16 +1770,20 @@
         ? Math.max(...dayMap.map(([, n]) => n))
         : 1}
     {@const topRamps = [...stats.byRamp.entries()]
-        .map(([id, count]) =>
-            [id, count, stats.utilByRamp.get(id) ?? 0] as [number, number, number],
+        .map(
+            ([id, count]) =>
+                [id, count, stats.utilByRamp.get(id) ?? 0] as [
+                    number,
+                    number,
+                    number,
+                ],
         )
         .sort((a, b) => b[1] - a[1])
         .slice(0, 8)}
-    {@const userRows = [...stats.byUser.entries()].sort(
-        (a, b) => b[1] - a[1],
-    )}
-    {@const hourRows = Array.from({ length: 24 }, (_, h) =>
-        [h, stats.byHour.get(h) ?? 0] as [number, number],
+    {@const userRows = [...stats.byUser.entries()].sort((a, b) => b[1] - a[1])}
+    {@const hourRows = Array.from(
+        { length: 24 },
+        (_, h) => [h, stats.byHour.get(h) ?? 0] as [number, number],
     )}
     {@const maxHourCount = Math.max(1, ...hourRows.map(([, n]) => n))}
     <div
@@ -1928,14 +1955,20 @@
                             style="letter-spacing:1.2px; color:var(--tr-text-faint);"
                         >
                             <span>Aktivität nach Tagesstunde</span>
-                            <span style="text-transform:none; letter-spacing:0;">
+                            <span
+                                style="text-transform:none; letter-spacing:0;"
+                            >
                                 Peak: {hourRows.reduce(
-                                    (best, [h, n]) => (n > best[1] ? [h, n] : best),
+                                    (best, [h, n]) =>
+                                        n > best[1] ? [h, n] : best,
                                     [0, 0] as [number, number],
                                 )[0]}:00 Uhr
                             </span>
                         </div>
-                        <div class="flex items-end gap-[3px]" style="height:52px;">
+                        <div
+                            class="flex items-end gap-[3px]"
+                            style="height:52px;"
+                        >
                             {#each hourRows as [hour, count]}
                                 {@const pct =
                                     maxHourCount > 0
@@ -1943,7 +1976,10 @@
                                         : 0}
                                 <div
                                     class="flex flex-col items-center gap-1 flex-1 min-w-0"
-                                    title="{String(hour).padStart(2, '0')}:00 — {count} Ereignisse"
+                                    title="{String(hour).padStart(
+                                        2,
+                                        '0',
+                                    )}:00 — {count} Ereignisse"
                                 >
                                     <div
                                         class="w-full rounded-t-[2px]"
@@ -2588,8 +2624,7 @@
                         viewBox="0 0 24 24"
                         fill="none"
                         stroke="currentColor"
-                        stroke-width="2"
-                        ><path d="M18 6L6 18M6 6l12 12" /></svg
+                        stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg
                     >
                 </button>
             </div>
@@ -2671,6 +2706,129 @@
                     style="border:1px solid var(--tr-warning); background:var(--tr-warning); color:#000;"
                 >
                     Bestätigen
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+{#if releaseDialog}
+    <div
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        style="background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
+        onclick={(e) => {
+            if (e.target === e.currentTarget) cancelReleaseDialog();
+        }}
+        onkeydown={(e) => {
+            if (e.key === "Escape") cancelReleaseDialog();
+            if (e.key === "Enter") confirmReleaseDialog();
+        }}
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-label="Rampe freigeben"
+    >
+        <div
+            class="flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+            style="width: 420px; max-width: 96vw; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+        >
+            <!-- Header -->
+            <div
+                class="flex items-center gap-4 px-6 py-4 shrink-0"
+                style="border-bottom: 1px solid var(--tr-line); background: var(--tr-always-dark);"
+            >
+                <div class="flex-1">
+                    <div class="text-[15px] font-semibold" style="color:#fff;">
+                        Rampe {releaseDialog.ramp.id} · Freigabe
+                    </div>
+                    <div
+                        class="font-mono text-[10.5px] uppercase mt-[3px]"
+                        style="letter-spacing:1.4px; color:rgba(255,255,255,0.45);"
+                    >
+                        Belegt → Frei
+                    </div>
+                </div>
+                <button
+                    onclick={cancelReleaseDialog}
+                    aria-label="Schließen"
+                    class="w-8 h-8 rounded-lg grid place-items-center cursor-pointer"
+                    style="border:1px solid rgba(255,255,255,0.1); background:transparent; color:rgba(255,255,255,0.6);"
+                >
+                    <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg
+                    >
+                </button>
+            </div>
+
+            <!-- Body -->
+            <div class="flex flex-col gap-3 px-6 py-5">
+                <div
+                    class="text-[13px]"
+                    style="color:var(--tr-text); line-height:1.5;"
+                >
+                    Rampe wirklich freigeben? LKW- und Reservierungs-Daten
+                    werden gelöscht.
+                </div>
+                {#if releaseDialog.ramp.kennzeichen || releaseDialog.ramp.reserviert_fuer}
+                    <div
+                        class="flex flex-col gap-1.5 rounded-md px-3 py-2"
+                        style="background:var(--tr-surface2); border:1px solid var(--tr-line);"
+                    >
+                        {#if releaseDialog.ramp.kennzeichen}
+                            <div class="flex items-baseline gap-2">
+                                <span
+                                    class="font-mono text-[9px] uppercase w-8 flex-shrink-0"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                    >LKW</span
+                                >
+                                <span
+                                    class="font-mono text-[12px]"
+                                    style="color:var(--tr-text);"
+                                    >{releaseDialog.ramp.kennzeichen}</span
+                                >
+                            </div>
+                        {/if}
+                        {#if releaseDialog.ramp.reserviert_fuer}
+                            <div class="flex items-baseline gap-2">
+                                <span
+                                    class="font-mono text-[9px] uppercase w-8 flex-shrink-0"
+                                    style="letter-spacing:1px; color:var(--tr-text-faint);"
+                                    >RES</span
+                                >
+                                <span
+                                    class="text-[12px]"
+                                    style="color:var(--tr-text);"
+                                    >{releaseDialog.ramp.reserviert_fuer}</span
+                                >
+                            </div>
+                        {/if}
+                    </div>
+                {/if}
+            </div>
+
+            <!-- Footer -->
+            <div
+                class="flex items-center justify-end gap-2 px-6 py-4"
+                style="border-top:1px solid var(--tr-line); background:var(--tr-surface2);"
+            >
+                <button
+                    onclick={cancelReleaseDialog}
+                    class="px-4 h-9 rounded-lg text-[13px] font-medium cursor-pointer"
+                    style="border:1px solid var(--tr-line); background:transparent; color:var(--tr-text);"
+                >
+                    Abbrechen
+                </button>
+                <button
+                    onclick={confirmReleaseDialog}
+                    class="px-4 h-9 rounded-lg text-[13px] font-semibold cursor-pointer"
+                    style="border:1px solid var(--tr-green); background:var(--tr-green); color:#000;"
+                >
+                    Freigeben
                 </button>
             </div>
         </div>
