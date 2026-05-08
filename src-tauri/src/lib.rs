@@ -131,10 +131,34 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             role     TEXT NOT NULL DEFAULT 'member_lager'
-        );",
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO meta (key, value) VALUES ('state_version', 1);",
     )?;
     ensure_canonical_ramps(conn)?;
     Ok(())
+}
+
+// ── State version (bumped on every ramps/messages mutation) ──────────────────
+
+fn current_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'state_version'",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn bump_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "UPDATE meta SET value = value + 1 WHERE key = 'state_version'",
+        [],
+    )?;
+    current_version(conn)
 }
 
 // ── Ramp helpers ─────────────────────────────────────────────────────────────
@@ -154,13 +178,17 @@ fn ensure_canonical_ramps(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 fn load_all_ramps(conn: &Connection) -> Result<Vec<Ramp>, rusqlite::Error> {
     let all_ids: Vec<u32> = SECTION_A.iter().chain(SECTION_B.iter()).copied().collect();
+    let now_ms = Local::now().timestamp_millis();
+    // locked_until is masked at read time when expired so polls don't need to UPDATE.
+    // Stale persisted values are harmless — the next status-changing update_ramp overwrites them.
     let mut stmt = conn.prepare(
         "SELECT id, name, status, last_updated_by, last_updated_at,
-                locked_until, kennzeichen, notiz, reserviert_fuer
+                CASE WHEN locked_until > ?1 THEN locked_until ELSE NULL END,
+                kennzeichen, notiz, reserviert_fuer
          FROM ramps ORDER BY id",
     )?;
     let mut ramps: Vec<Ramp> = stmt
-        .query_map([], |row| {
+        .query_map(params![now_ms], |row| {
             Ok(Ramp {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -292,16 +320,31 @@ fn get_current_user() -> String {
 #[command]
 fn get_ramps(state: State<DbState>) -> Result<Vec<Ramp>, String> {
     let db = state.0.lock().map_err(|e| e.to_string())?;
-    let now_ms = Local::now().timestamp_millis();
-
-    // Clear expired locks
-    db.execute(
-        "UPDATE ramps SET locked_until = NULL WHERE locked_until IS NOT NULL AND locked_until <= ?1",
-        params![now_ms],
-    )
-    .map_err(|e| e.to_string())?;
-
     load_all_ramps(&db).map_err(|e| e.to_string())
+}
+
+/// Coalesced poll payload. When `since_version` matches the server's current
+/// state_version, `ramps` and `messages` are `None` so the client skips the
+/// full SELECTs and JSON serialization. Both are bumped on any mutation
+/// (status change, field edit, chat message), so a stable version means
+/// stable state.
+#[derive(Serialize, Clone, Debug)]
+struct StatePayload {
+    version: i64,
+    ramps: Option<Vec<Ramp>>,
+    messages: Option<Vec<ChatMessage>>,
+}
+
+#[command]
+fn get_state(state: State<DbState>, since_version: Option<i64>) -> Result<StatePayload, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    let version = current_version(&db).map_err(|e| e.to_string())?;
+    if since_version == Some(version) {
+        return Ok(StatePayload { version, ramps: None, messages: None });
+    }
+    let ramps = load_all_ramps(&db).map_err(|e| e.to_string())?;
+    let messages = load_recent_messages(&db).map_err(|e| e.to_string())?;
+    Ok(StatePayload { version, ramps: Some(ramps), messages: Some(messages) })
 }
 
 #[command]
@@ -381,18 +424,16 @@ fn update_ramp(state: State<DbState>, updated_ramp: Ramp) -> Result<Vec<Ramp>, S
     )
     .map_err(|e| e.to_string())?;
 
+    bump_version(&db).map_err(|e| e.to_string())?;
+
     load_all_ramps(&db).map_err(|e| e.to_string())
 }
 
-#[command]
-fn get_messages(state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
-    let db = state.0.lock().map_err(|e| e.to_string())?;
-    let mut stmt = db
-        .prepare(
-            "SELECT id, user, text, timestamp FROM chat_messages
-             ORDER BY timestamp DESC LIMIT 50",
-        )
-        .map_err(|e| e.to_string())?;
+fn load_recent_messages(conn: &Connection) -> Result<Vec<ChatMessage>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, user, text, timestamp FROM chat_messages
+         ORDER BY timestamp DESC LIMIT 50",
+    )?;
     let mut msgs: Vec<ChatMessage> = stmt
         .query_map([], |row| {
             Ok(ChatMessage {
@@ -401,12 +442,17 @@ fn get_messages(state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
                 text: row.get(2)?,
                 timestamp: row.get(3)?,
             })
-        })
-        .map_err(|e| e.to_string())?
+        })?
         .filter_map(|r| r.ok())
         .collect();
     msgs.reverse(); // oldest first for display
     Ok(msgs)
+}
+
+#[command]
+fn get_messages(state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    load_recent_messages(&db).map_err(|e| e.to_string())
 }
 
 #[command]
@@ -439,19 +485,9 @@ fn send_message(state: State<DbState>, user: String, text: String) -> Result<Vec
     )
     .map_err(|e| e.to_string())?;
 
-    // Return last 50, oldest first — replicate get_messages logic without re-locking
-    let mut stmt = db
-        .prepare("SELECT id, user, text, timestamp FROM chat_messages ORDER BY timestamp DESC LIMIT 50")
-        .map_err(|e| e.to_string())?;
-    let mut msgs: Vec<ChatMessage> = stmt
-        .query_map([], |row| Ok(ChatMessage {
-            id: row.get(0)?, user: row.get(1)?, text: row.get(2)?, timestamp: row.get(3)?,
-        }))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    msgs.reverse();
-    Ok(msgs)
+    bump_version(&db).map_err(|e| e.to_string())?;
+
+    load_recent_messages(&db).map_err(|e| e.to_string())
 }
 
 #[command]
@@ -587,6 +623,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_current_user,
             get_ramps,
+            get_state,
             update_ramp,
             get_messages,
             send_message,
