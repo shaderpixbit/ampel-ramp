@@ -142,9 +142,9 @@
 
     async function cycleStatus(ramp: Ramp) {
         if (isUpdating || isRampLocked(ramp)) return;
-        // member_buero: free → pending → closed → free  (full 3-way cycle for reservations)
-        // everyone else (lager + admin): free/pending → closed → free  (direct toggle)
-        const newStatus = userRole === "member_buero"
+        // admin + member_buero: free → pending → closed → free  (full 3-way cycle for reservations)
+        // member_lager: free/pending → closed → free  (direct toggle)
+        const newStatus = isBuero
             ? cycleRampStatus(ramp.status)
             : ramp.status === "closed"
               ? "free"
