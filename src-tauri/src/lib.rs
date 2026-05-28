@@ -130,7 +130,7 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
-            role     TEXT NOT NULL DEFAULT 'member_lager'
+            role     TEXT NOT NULL DEFAULT 'member_view'
         );
 
         CREATE TABLE IF NOT EXISTS meta (
@@ -205,7 +205,12 @@ fn load_all_ramps(conn: &Connection) -> Result<Vec<Ramp>, rusqlite::Error> {
         .collect();
 
     // Sort to canonical order (Section A then B)
-    ramps.sort_by_key(|r| all_ids.iter().position(|&id| id == r.id).unwrap_or(usize::MAX));
+    ramps.sort_by_key(|r| {
+        all_ids
+            .iter()
+            .position(|&id| id == r.id)
+            .unwrap_or(usize::MAX)
+    });
     Ok(ramps)
 }
 
@@ -243,9 +248,15 @@ fn base_dir() -> PathBuf {
 
 fn import_ramps_json(conn: &Connection) {
     let src = base_dir().join("ramps_state.json");
-    if !src.exists() { return; }
-    let Ok(text) = std::fs::read_to_string(&src) else { return };
-    let Ok(ramps) = serde_json::from_str::<Vec<Ramp>>(&text) else { return };
+    if !src.exists() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&src) else {
+        return;
+    };
+    let Ok(ramps) = serde_json::from_str::<Vec<Ramp>>(&text) else {
+        return;
+    };
     for r in ramps {
         let _ = conn.execute(
             "INSERT OR REPLACE INTO ramps
@@ -253,8 +264,15 @@ fn import_ramps_json(conn: &Connection) {
               locked_until, kennzeichen, notiz, reserviert_fuer)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                r.id, r.name, r.status, r.last_updated_by, r.last_updated_at,
-                r.locked_until, r.kennzeichen, r.notiz, r.reserviert_fuer
+                r.id,
+                r.name,
+                r.status,
+                r.last_updated_by,
+                r.last_updated_at,
+                r.locked_until,
+                r.kennzeichen,
+                r.notiz,
+                r.reserviert_fuer
             ],
         );
     }
@@ -264,9 +282,15 @@ fn import_ramps_json(conn: &Connection) {
 
 fn import_chat_json(conn: &Connection) {
     let src = base_dir().join("chat_messages.json");
-    if !src.exists() { return; }
-    let Ok(text) = std::fs::read_to_string(&src) else { return };
-    let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&text) else { return };
+    if !src.exists() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&src) else {
+        return;
+    };
+    let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&text) else {
+        return;
+    };
     for m in msgs {
         let _ = conn.execute(
             "INSERT OR IGNORE INTO chat_messages (id, user, text, timestamp)
@@ -281,14 +305,20 @@ fn import_chat_json(conn: &Connection) {
 fn import_events_json(conn: &Connection) {
     // Import all ramp_events_YYYY-MM.json files found next to the executable
     let dir = base_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with("ramp_events_") && name.ends_with(".json") {
             let path = entry.path();
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let Ok(events) = serde_json::from_str::<Vec<RampEvent>>(&text) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(events) = serde_json::from_str::<Vec<RampEvent>>(&text) else {
+                continue;
+            };
             for e in events {
                 let _ = conn.execute(
                     "INSERT INTO ramp_events
@@ -296,8 +326,14 @@ fn import_events_json(conn: &Connection) {
                       kennzeichen, reserviert_fuer, duration_min)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
-                        e.timestamp, e.ramp_id, e.from_status, e.to_status,
-                        e.user, e.kennzeichen, e.reserviert_fuer, e.duration_min
+                        e.timestamp,
+                        e.ramp_id,
+                        e.from_status,
+                        e.to_status,
+                        e.user,
+                        e.kennzeichen,
+                        e.reserviert_fuer,
+                        e.duration_min
                     ],
                 );
             }
@@ -340,11 +376,19 @@ fn get_state(state: State<DbState>, since_version: Option<i64>) -> Result<StateP
     let db = state.0.lock().map_err(|e| e.to_string())?;
     let version = current_version(&db).map_err(|e| e.to_string())?;
     if since_version == Some(version) {
-        return Ok(StatePayload { version, ramps: None, messages: None });
+        return Ok(StatePayload {
+            version,
+            ramps: None,
+            messages: None,
+        });
     }
     let ramps = load_all_ramps(&db).map_err(|e| e.to_string())?;
     let messages = load_recent_messages(&db).map_err(|e| e.to_string())?;
-    Ok(StatePayload { version, ramps: Some(ramps), messages: Some(messages) })
+    Ok(StatePayload {
+        version,
+        ramps: Some(ramps),
+        messages: Some(messages),
+    })
 }
 
 #[command]
@@ -367,7 +411,10 @@ fn update_ramp(state: State<DbState>, updated_ramp: Ramp) -> Result<Vec<Ramp>, S
         )
         .ok();
 
-    let status_changed = old.as_ref().map(|(s, _)| s != &updated_ramp.status).unwrap_or(false);
+    let status_changed = old
+        .as_ref()
+        .map(|(s, _)| s != &updated_ramp.status)
+        .unwrap_or(false);
 
     if status_changed {
         let duration_min = old
@@ -456,7 +503,11 @@ fn get_messages(state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
 }
 
 #[command]
-fn send_message(state: State<DbState>, user: String, text: String) -> Result<Vec<ChatMessage>, String> {
+fn send_message(
+    state: State<DbState>,
+    user: String,
+    text: String,
+) -> Result<Vec<ChatMessage>, String> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return Err("Message cannot be empty".to_string());
@@ -466,7 +517,9 @@ fn send_message(state: State<DbState>, user: String, text: String) -> Result<Vec
     let now = Local::now();
     // Combine user prefix + nanoseconds to avoid ID collisions when multiple users send at once
     let user_prefix: String = user.chars().take(6).collect();
-    let ns = now.timestamp_nanos_opt().unwrap_or(now.timestamp_millis() * 1_000_000);
+    let ns = now
+        .timestamp_nanos_opt()
+        .unwrap_or(now.timestamp_millis() * 1_000_000);
     let id = format!("{}-{}", user_prefix, ns);
     let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
 
@@ -538,16 +591,17 @@ fn query_events(conn: &Connection, from: &str, to: &str) -> Result<Vec<RampEvent
 
 // ── User-role commands ────────────────────────────────────────────────────────
 
-const VALID_ROLES: &[&str] = &["admin", "member_buero", "member_lager"];
+const VALID_ROLES: &[&str] = &["admin", "member_buero", "member_lager", "member_view"];
 
 #[command]
 fn get_user_role(state: State<DbState>, username: String) -> Result<String, String> {
     let db = state.0.lock().map_err(|e| e.to_string())?;
+    let username_lc = username.to_lowercase();
 
     let existing: Option<String> = db
         .query_row(
             "SELECT role FROM users WHERE username = ?1",
-            params![username],
+            params![username_lc],
             |row| row.get(0),
         )
         .ok();
@@ -556,7 +610,7 @@ fn get_user_role(state: State<DbState>, username: String) -> Result<String, Stri
         return Ok(role);
     }
 
-    // First user ever becomes admin; all subsequent new users get member_lager
+    // First user ever becomes admin; all subsequent new users get view-only
     let user_count: i64 = db
         .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
         .unwrap_or(0);
@@ -564,12 +618,12 @@ fn get_user_role(state: State<DbState>, username: String) -> Result<String, Stri
     let role = if user_count == 0 {
         "admin".to_string()
     } else {
-        "member_lager".to_string()
+        "member_view".to_string()
     };
 
     db.execute(
         "INSERT INTO users (username, role) VALUES (?1, ?2)",
-        params![username, role],
+        params![username_lc, role],
     )
     .map_err(|e| e.to_string())?;
 
@@ -580,12 +634,13 @@ fn get_user_role(state: State<DbState>, username: String) -> Result<String, Stri
 fn set_user_role(state: State<DbState>, username: String, role: String) -> Result<(), String> {
     if !VALID_ROLES.contains(&role.as_str()) {
         return Err(format!("Invalid role '{}'", role));
-    }
+    };
+    let username_lc = username.to_lowercase();
     let db = state.0.lock().map_err(|e| e.to_string())?;
     db.execute(
         "INSERT INTO users (username, role) VALUES (?1, ?2)
          ON CONFLICT(username) DO UPDATE SET role = excluded.role",
-        params![username, role],
+        params![username_lc, role],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

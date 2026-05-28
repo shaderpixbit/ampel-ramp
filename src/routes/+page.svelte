@@ -144,7 +144,7 @@
     }
 
     async function cycleStatus(ramp: Ramp) {
-        if (isUpdating || isRampLocked(ramp)) return;
+        if (!canModify || isUpdating || isRampLocked(ramp)) return;
         // admin + member_buero: free → pending → closed → free  (full 3-way cycle for reservations)
         // member_lager: free/pending → closed → free  (direct toggle)
         const newStatus = isBuero
@@ -325,9 +325,11 @@
             : 0,
     );
 
-    let userRole = $state("member_lager");
+    let userRole = $state("member_view");
     let isBuero = $derived(userRole === "admin" || userRole === "member_buero");
     let isAdmin = $derived(userRole === "admin");
+    // member_view is read-only: can see ramp status but change nothing
+    let canModify = $derived(userRole !== "member_view");
     let focusTrap: HTMLElement;
     let rampsA = $derived(
         [...ramps]
@@ -458,7 +460,8 @@
     function roleLabel(role: string): string {
         if (role === "admin") return "Admin";
         if (role === "member_buero") return "Büro";
-        return "Lager";
+        if (role === "member_lager") return "Lager";
+        return "Ansicht";
     }
 
     // Average time (minutes) spent in any occupied state today
@@ -1091,7 +1094,7 @@
                           minute: "2-digit",
                       })
                     : null}
-                {@const canEdit = isConnected && !isUpdating && !locked}
+                {@const canEdit = canModify && isConnected && !isUpdating && !locked}
                 {@const isEditKfz =
                     editingField?.rampId === ramp.id &&
                     editingField?.field === "kennzeichen"}
@@ -2549,8 +2552,11 @@
                                             class="rounded-[6px] px-2 py-1.5 text-[12px] outline-none cursor-pointer"
                                             style="background:var(--tr-surface2); border:1px solid var(--tr-line); color:var(--tr-text);"
                                         >
+                                            <option value="member_view"
+                                                >Ansicht (Standard)</option
+                                            >
                                             <option value="member_lager"
-                                                >Lager (Standard)</option
+                                                >Lager</option
                                             >
                                             <option value="member_buero"
                                                 >Büro</option
