@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount, onDestroy, tick } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { save } from "@tauri-apps/plugin-dialog";
     import { writeTextFile } from "@tauri-apps/plugin-fs";
@@ -8,24 +8,25 @@
         isRampLocked,
         getStatusLabel,
         cycleRampStatus,
-        formatTime,
-        formatDate,
         type Ramp,
         type RampStatus,
     } from "$lib/ramp-utils";
     import { LoaderCircleIcon } from "@lucide/svelte";
+    import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-    interface ChatMessage {
-        id: string;
-        user: string;
-        text: string;
-        timestamp: string;
+    interface ConversationSummary {
+        conversation: string;
+        unread: number;
+    }
+
+    interface ChatOverview {
+        version: number;
+        conversations: ConversationSummary[] | null;
     }
 
     interface StatePayload {
         version: number;
         ramps: Ramp[] | null;
-        messages: ChatMessage[] | null;
     }
 
     let ramps = $state<Ramp[]>([]);
@@ -38,15 +39,9 @@
     let syncError = $state<string | null>(null);
     let errorTimeout: number;
 
-    let messages = $state<ChatMessage[]>([]);
-    let chatInput = $state("");
-    let isSendingMessage = $state(false);
-    let chatScrollEl: HTMLElement;
-    let chatOpen = $state(false);
-    let lastReadCount = $state(0);
-    let unreadCount = $derived(
-        chatOpen ? 0 : Math.max(0, messages.length - lastReadCount),
-    );
+    // Chat runs in a separate window; the main window only tracks the unread badge.
+    let unreadCount = $state(0);
+    let lastChatVersion: number | null = null;
 
     let now = $state(Date.now());
     let clockInterval: number;
@@ -79,13 +74,6 @@
 
         await fetchRamps();
 
-        try {
-            messages = await invoke("get_messages");
-            lastReadCount = messages.length;
-        } catch (e) {
-            console.error("Failed to load messages:", e);
-        }
-
         clockInterval = window.setInterval(() => {
             now = Date.now();
         }, 1000);
@@ -109,16 +97,6 @@
 
                 if (payload.ramps !== null) ramps = payload.ramps;
 
-                if (payload.messages !== null) {
-                    messages = payload.messages;
-                    if (chatOpen) {
-                        lastReadCount = messages.length;
-                        await tick();
-                        if (chatScrollEl)
-                            chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
-                    }
-                }
-
                 lastVersion = payload.version;
                 isConnected = true;
             } catch (e) {
@@ -126,6 +104,24 @@
                 isConnected = false;
             } finally {
                 isFetching = false;
+            }
+
+            // Chat unread badge (chat itself lives in its own window).
+            try {
+                const ov = await invoke<ChatOverview>("get_chat_overview", {
+                    username: currentUser,
+                    role: userRole,
+                    sinceVersion: lastChatVersion,
+                });
+                if (ov.conversations !== null) {
+                    unreadCount = ov.conversations.reduce(
+                        (s, c) => s + c.unread,
+                        0,
+                    );
+                }
+                lastChatVersion = ov.version;
+            } catch (e) {
+                console.error("Failed to fetch chat overview:", e);
             }
         }
         syncTimeout = window.setTimeout(startPolling, 1500);
@@ -237,40 +233,31 @@
         releaseFocus();
     }
 
-    async function sendMessage() {
-        const text = chatInput.trim();
-        if (!text || isSendingMessage) return;
-        chatInput = "";
-        isSendingMessage = true;
+    async function openChatWindow() {
         try {
-            const updated: ChatMessage[] = await invoke("send_message", {
-                user: currentUser,
-                text,
+            const existing = await WebviewWindow.getByLabel("chat");
+            if (existing) {
+                await existing.show();
+                await existing.setFocus();
+                return;
+            }
+            const chat = new WebviewWindow("chat", {
+                url: "/chat",
+                title: "Team Chat",
+                width: 760,
+                height: 720,
+                minWidth: 420,
+                minHeight: 480,
+                resizable: true,
             });
-            messages = updated;
-            lastVersion = null; // resync version cursor on next poll
-            lastReadCount = messages.length;
-            await tick();
-            if (chatScrollEl)
-                chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+            chat.once("tauri://error", (e) => {
+                console.error("Failed to open chat window:", e);
+                showError("Chat-Fenster konnte nicht geöffnet werden.");
+            });
         } catch (e) {
-            console.error("Failed to send message:", e);
-            chatInput = text;
-            showError("Nachricht konnte nicht gesendet werden.");
-        } finally {
-            isSendingMessage = false;
+            console.error("Failed to open chat window:", e);
+            showError("Chat-Fenster konnte nicht geöffnet werden.");
         }
-    }
-
-    async function openChat() {
-        chatOpen = true;
-        lastReadCount = messages.length;
-        await tick();
-        if (chatScrollEl) chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
-    }
-
-    function closeChat() {
-        chatOpen = false;
     }
 
     function parseTsMs(ts: string): number {
@@ -953,38 +940,35 @@
             >
         </button>
 
-        <!-- Chat toggle -->
-        <button
-            onclick={chatOpen ? closeChat : openChat}
-            class="relative h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer transition-colors"
-            style="border: 1px solid {chatOpen
-                ? 'var(--tr-red)'
-                : 'rgba(255,255,255,0.1)'}; background: {chatOpen
-                ? 'rgba(218,43,41,0.15)'
-                : 'rgba(255,255,255,0.04)'}; color: {chatOpen
-                ? '#FF6B69'
-                : 'rgba(255,255,255,0.9)'};"
-        >
-            <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                ><path
-                    d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
-                /></svg
+        <!-- Chat window launcher (Lager + Büro only) -->
+        {#if isBuero || userRole === "member_lager"}
+            <button
+                onclick={openChatWindow}
+                class="relative h-[34px] px-4 rounded-[10px] flex items-center gap-2 text-[13px] font-medium cursor-pointer transition-colors"
+                style="border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.9);"
+                aria-label="Chat öffnen"
             >
-            Team
-            {#if unreadCount > 0}
-                <span
-                    class="min-w-[18px] h-[18px] px-[5px] rounded-full grid place-items-center text-[10px] font-semibold font-mono"
-                    style="background: var(--tr-red); color: #fff;"
-                    >{unreadCount}</span
+                <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    ><path
+                        d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+                    /></svg
                 >
-            {/if}
-        </button>
+                Chat
+                {#if unreadCount > 0}
+                    <span
+                        class="min-w-[18px] h-[18px] px-[5px] rounded-full grid place-items-center text-[10px] font-semibold font-mono"
+                        style="background: var(--tr-red); color: #fff;"
+                        >{unreadCount}</span
+                    >
+                {/if}
+            </button>
+        {/if}
 
         <!-- User chip -->
         <div
@@ -1570,198 +1554,6 @@
                 </div>
             {/if}
         </main>
-
-        <!-- ── Chat panel ── -->
-        <aside
-            class="absolute top-0 right-0 bottom-0 overflow-hidden flex flex-col chat-panel"
-            style="width: {chatOpen
-                ? '360px'
-                : '0px'}; background: var(--tr-surface); border-left: 1px solid {chatOpen
-                ? 'var(--tr-line)'
-                : 'transparent'};"
-        >
-            <!-- Chat header -->
-            <div
-                class="flex items-start gap-2.5 px-5 py-[18px] shrink-0"
-                style="border-bottom: 1px solid var(--tr-line);"
-            >
-                <div class="flex-1 min-w-0">
-                    <div
-                        class="text-[14px] font-semibold tracking-[-0.1px]"
-                        style="color: var(--tr-text);"
-                    >
-                        Team Chat
-                    </div>
-                    <div
-                        class="font-mono text-[10.5px] uppercase tracking-[0.6px] mt-[3px]"
-                        style="color: var(--tr-text-faint);"
-                    >
-                        {messages.length} Nachrichten
-                    </div>
-                </div>
-                <button
-                    onclick={closeChat}
-                    aria-label="Chat schließen"
-                    class="w-7 h-7 rounded-[7px] grid place-items-center cursor-pointer transition-colors"
-                    style="border: 1px solid var(--tr-line); background: transparent; color: var(--tr-text-dim);"
-                >
-                    <svg
-                        width="12"
-                        height="12"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg
-                    >
-                </button>
-            </div>
-
-            <!-- Messages -->
-            <div
-                bind:this={chatScrollEl}
-                class="flex-1 overflow-y-auto chat-scroll flex flex-col gap-4 min-h-0"
-                style="padding: 16px 18px;"
-            >
-                {#if messages.length === 0}
-                    <p
-                        class="text-xs text-center pt-12"
-                        style="color: var(--tr-text-faint);"
-                    >
-                        Noch keine Nachrichten
-                    </p>
-                {/if}
-
-                {#each messages as msg, i (msg.id)}
-                    {@const isOwn = msg.user === currentUser}
-                    {@const prevMsg = i > 0 ? messages[i - 1] : null}
-                    {@const isFirst = !prevMsg || prevMsg.user !== msg.user}
-                    {@const isDiffDay =
-                        !prevMsg ||
-                        formatDate(msg.timestamp) !==
-                            formatDate(prevMsg.timestamp)}
-
-                    {#if isDiffDay}
-                        <div class="flex items-center gap-2 my-1">
-                            <div
-                                class="flex-1 h-px"
-                                style="background: var(--tr-line);"
-                            ></div>
-                            <span
-                                class="font-mono text-[10px] uppercase tracking-[1.2px]"
-                                style="color: var(--tr-text-faint);"
-                                >{formatDate(msg.timestamp)}</span
-                            >
-                            <div
-                                class="flex-1 h-px"
-                                style="background: var(--tr-line);"
-                            ></div>
-                        </div>
-                    {/if}
-
-                    <div
-                        class="flex gap-2.5 {isOwn
-                            ? 'flex-row-reverse'
-                            : 'flex-row'} {isFirst ? 'mt-1' : 'mt-[-6px]'}"
-                    >
-                        {#if !isOwn}
-                            {#if isFirst}
-                                <div
-                                    class="w-7 h-7 rounded-full grid place-items-center text-[11.5px] font-semibold shrink-0 mb-[2px]"
-                                    style="background: var(--tr-surface2); border: 1px solid var(--tr-line); color: var(--tr-text-dim);"
-                                >
-                                    {msg.user.charAt(0).toUpperCase()}
-                                </div>
-                            {:else}
-                                <div class="w-7 shrink-0"></div>
-                            {/if}
-                        {/if}
-
-                        <div
-                            class="flex flex-col {isOwn
-                                ? 'items-end'
-                                : 'items-start'} max-w-[78%]"
-                        >
-                            {#if isFirst && !isOwn}
-                                <div
-                                    class="font-mono text-[11px] mb-[5px]"
-                                    style="color: var(--tr-text-dim);"
-                                >
-                                    {msg.user}
-                                    <span style="color: var(--tr-text-faint);"
-                                        >· {formatTime(msg.timestamp)}</span
-                                    >
-                                </div>
-                            {/if}
-                            <div
-                                class="text-[13px] leading-[1.45] px-[13px] py-2 break-words"
-                                style="
-                                     background: {isOwn
-                                    ? 'var(--tr-red)'
-                                    : 'var(--tr-surface2)'};
-                                     color: {isOwn ? '#fff' : 'var(--tr-text)'};
-                                     border-radius: {isOwn
-                                    ? '12px 12px 3px 12px'
-                                    : '3px 12px 12px 12px'};
-                                     border: {isOwn
-                                    ? 'none'
-                                    : '1px solid var(--tr-line)'};
-                                 "
-                            >
-                                {msg.text}
-                            </div>
-                            {#if isOwn}
-                                <div
-                                    class="font-mono text-[10.5px] mt-[5px]"
-                                    style="color: var(--tr-text-faint);"
-                                >
-                                    {formatTime(msg.timestamp)}
-                                </div>
-                            {/if}
-                        </div>
-                    </div>
-                {/each}
-            </div>
-
-            <!-- Input -->
-            <form
-                onsubmit={(e) => {
-                    e.preventDefault();
-                    sendMessage();
-                }}
-                class="flex gap-2 shrink-0 p-[12px_14px]"
-                style="border-top: 1px solid var(--tr-line);"
-            >
-                <input
-                    type="text"
-                    bind:value={chatInput}
-                    placeholder="Nachricht…"
-                    disabled={isSendingMessage}
-                    maxlength={300}
-                    onkeydown={(e) => {
-                        if (e.key === "Escape") e.currentTarget.blur();
-                    }}
-                    class="flex-1 h-9 px-3 rounded-[8px] text-[13px] outline-none transition-colors disabled:opacity-50"
-                    style="border: 1px solid var(--tr-line); background: var(--tr-bg); color: var(--tr-text); font-family: 'Inter Variable', sans-serif;"
-                />
-                <button
-                    type="submit"
-                    disabled={isSendingMessage || !chatInput.trim()}
-                    aria-label="Senden"
-                    class="w-9 h-9 rounded-[8px] grid place-items-center cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed transition-opacity"
-                    style="border: none; background: var(--tr-red); color: #fff;"
-                >
-                    <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        ><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" /></svg
-                    >
-                </button>
-            </form>
-        </aside>
     </div>
 </div>
 
@@ -2861,10 +2653,6 @@
     }
     .ramp-tile:active {
         transform: scale(0.98);
-    }
-
-    .chat-panel {
-        transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
     .chat-scroll {

@@ -1,5 +1,5 @@
 use chrono::{Local, TimeZone};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -8,7 +8,11 @@ use tauri::{command, State};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const VALID_STATUSES: &[&str] = &["free", "pending", "closed"];
+/// Max messages kept per conversation thread.
 const MAX_CHAT_MESSAGES: usize = 100;
+/// Sentinel conversation key for the read-only legacy broadcast thread
+/// (rows whose `conversation` column is NULL). Visible to Büro/Admin only.
+const GENERAL: &str = "__general__";
 
 /// Section A: Tor 30–42 (13 ramps). Adjust here if numbering changes.
 const SECTION_A: &[u32] = &[42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30];
@@ -44,6 +48,30 @@ struct ChatMessage {
     user: String,
     text: String,
     timestamp: String,
+    /// Lager-worker username owning the thread, or `None` for the legacy broadcast thread.
+    #[serde(default)]
+    conversation: Option<String>,
+    /// 'lager' | 'buero' | 'legacy'
+    #[serde(default)]
+    sender_role: String,
+}
+
+/// One row per Lager-worker thread (plus the legacy general thread) for the Büro inbox list.
+#[derive(Serialize, Clone, Debug)]
+struct ConversationSummary {
+    /// Lager-worker username, or the `GENERAL` sentinel for the legacy thread.
+    conversation: String,
+    last_text: Option<String>,
+    last_ts: Option<String>,
+    last_sender: Option<String>,
+    unread: i64,
+    is_legacy: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct ChatOverview {
+    version: i64,
+    conversations: Option<Vec<ConversationSummary>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -108,10 +136,19 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE TABLE IF NOT EXISTS chat_messages (
-            id        TEXT PRIMARY KEY,
-            user      TEXT NOT NULL,
-            text      TEXT NOT NULL,
-            timestamp TEXT NOT NULL
+            id           TEXT PRIMARY KEY,
+            user         TEXT NOT NULL,
+            text         TEXT NOT NULL,
+            timestamp    TEXT NOT NULL,
+            conversation TEXT,
+            sender_role  TEXT NOT NULL DEFAULT 'legacy'
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_reads (
+            username     TEXT NOT NULL,
+            conversation TEXT NOT NULL,
+            last_read    TEXT NOT NULL,
+            PRIMARY KEY (username, conversation)
         );
 
         CREATE TABLE IF NOT EXISTS ramp_events (
@@ -137,9 +174,37 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             key   TEXT PRIMARY KEY,
             value INTEGER NOT NULL
         );
-        INSERT OR IGNORE INTO meta (key, value) VALUES ('state_version', 1);",
+        INSERT OR IGNORE INTO meta (key, value) VALUES ('state_version', 1);
+        INSERT OR IGNORE INTO meta (key, value) VALUES ('chat_version', 1);",
     )?;
+    migrate_chat_schema(conn)?;
     ensure_canonical_ramps(conn)?;
+    Ok(())
+}
+
+/// Adds the `conversation` / `sender_role` columns to an existing `chat_messages`
+/// table (pre-threaded-chat DBs). Existing rows keep `conversation = NULL` and the
+/// default `sender_role = 'legacy'`, becoming the read-only legacy broadcast thread.
+fn migrate_chat_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(chat_messages)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if !cols.iter().any(|c| c == "conversation") {
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN conversation TEXT", [])?;
+    }
+    if !cols.iter().any(|c| c == "sender_role") {
+        conn.execute(
+            "ALTER TABLE chat_messages ADD COLUMN sender_role TEXT NOT NULL DEFAULT 'legacy'",
+            [],
+        )?;
+    }
+    // Created here (not in the schema batch) so the column exists first on upgraded DBs.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_conv ON chat_messages(conversation, timestamp)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -159,6 +224,23 @@ fn bump_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
         [],
     )?;
     current_version(conn)
+}
+
+// Separate counter so chat traffic (a separate window) doesn't force ramp refetches.
+fn chat_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'chat_version'",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn bump_chat_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "UPDATE meta SET value = value + 1 WHERE key = 'chat_version'",
+        [],
+    )?;
+    chat_version(conn)
 }
 
 // ── Ramp helpers ─────────────────────────────────────────────────────────────
@@ -359,16 +441,13 @@ fn get_ramps(state: State<DbState>) -> Result<Vec<Ramp>, String> {
     load_all_ramps(&db).map_err(|e| e.to_string())
 }
 
-/// Coalesced poll payload. When `since_version` matches the server's current
-/// state_version, `ramps` and `messages` are `None` so the client skips the
-/// full SELECTs and JSON serialization. Both are bumped on any mutation
-/// (status change, field edit, chat message), so a stable version means
-/// stable state.
+/// Coalesced ramp poll payload. When `since_version` matches the server's current
+/// `state_version`, `ramps` is `None` so the client skips the SELECT and JSON
+/// serialization. Chat lives in a separate window with its own poll (`get_chat_overview`).
 #[derive(Serialize, Clone, Debug)]
 struct StatePayload {
     version: i64,
     ramps: Option<Vec<Ramp>>,
-    messages: Option<Vec<ChatMessage>>,
 }
 
 #[command]
@@ -379,15 +458,12 @@ fn get_state(state: State<DbState>, since_version: Option<i64>) -> Result<StateP
         return Ok(StatePayload {
             version,
             ramps: None,
-            messages: None,
         });
     }
     let ramps = load_all_ramps(&db).map_err(|e| e.to_string())?;
-    let messages = load_recent_messages(&db).map_err(|e| e.to_string())?;
     Ok(StatePayload {
         version,
         ramps: Some(ramps),
-        messages: Some(messages),
     })
 }
 
@@ -476,47 +552,233 @@ fn update_ramp(state: State<DbState>, updated_ramp: Ramp) -> Result<Vec<Ramp>, S
     load_all_ramps(&db).map_err(|e| e.to_string())
 }
 
-fn load_recent_messages(conn: &Connection) -> Result<Vec<ChatMessage>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id, user, text, timestamp FROM chat_messages
-         ORDER BY timestamp DESC LIMIT 50",
-    )?;
-    let mut msgs: Vec<ChatMessage> = stmt
-        .query_map([], |row| {
-            Ok(ChatMessage {
-                id: row.get(0)?,
-                user: row.get(1)?,
-                text: row.get(2)?,
-                timestamp: row.get(3)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    msgs.reverse(); // oldest first for display
-    Ok(msgs)
+// ── Chat (threaded: shared Büro inbox, one thread per Lager worker) ───────────
+
+fn is_buero_role(role: &str) -> bool {
+    role == "admin" || role == "member_buero"
 }
 
-#[command]
-fn get_messages(state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
-    let db = state.0.lock().map_err(|e| e.to_string())?;
-    load_recent_messages(&db).map_err(|e| e.to_string())
+/// Builds the summary (last message + unread for `me`) for one conversation key.
+/// `conv_key` is a Lager-worker username, or `GENERAL` for the legacy thread.
+fn conv_summary(
+    conn: &Connection,
+    conv_key: &str,
+    me: &str,
+) -> Result<ConversationSummary, rusqlite::Error> {
+    let is_legacy = conv_key == GENERAL;
+
+    let last_read: String = conn
+        .query_row(
+            "SELECT last_read FROM chat_reads WHERE username = ?1 AND conversation = ?2",
+            params![me, conv_key],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+
+    let last: Option<(String, String, String)> = if is_legacy {
+        conn.query_row(
+            "SELECT text, timestamp, user FROM chat_messages
+             WHERE conversation IS NULL ORDER BY timestamp DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    } else {
+        conn.query_row(
+            "SELECT text, timestamp, user FROM chat_messages
+             WHERE conversation = ?1 ORDER BY timestamp DESC LIMIT 1",
+            params![conv_key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    };
+
+    let unread: i64 = if is_legacy {
+        conn.query_row(
+            "SELECT COUNT(*) FROM chat_messages
+             WHERE conversation IS NULL AND timestamp > ?1 AND lower(user) <> ?2",
+            params![last_read, me],
+            |r| r.get(0),
+        )?
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM chat_messages
+             WHERE conversation = ?1 AND timestamp > ?2 AND lower(user) <> ?3",
+            params![conv_key, last_read, me],
+            |r| r.get(0),
+        )?
+    };
+
+    let (last_text, last_ts, last_sender) = match last {
+        Some((t, ts, u)) => (Some(t), Some(ts), Some(u)),
+        None => (None, None, None),
+    };
+
+    Ok(ConversationSummary {
+        conversation: conv_key.to_string(),
+        last_text,
+        last_ts,
+        last_sender,
+        unread,
+        is_legacy,
+    })
 }
 
+/// Chat inbox poll. Mirrors `get_state`: returns `conversations = None` when the
+/// client's `since_version` matches the current `chat_version`.
+/// Lager sees only their own thread; Büro/Admin see every Lager thread plus the
+/// legacy general thread.
 #[command]
-fn send_message(
+fn get_chat_overview(
     state: State<DbState>,
-    user: String,
-    text: String,
+    username: String,
+    role: String,
+    since_version: Option<i64>,
+) -> Result<ChatOverview, String> {
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    let version = chat_version(&db).map_err(|e| e.to_string())?;
+    if since_version == Some(version) {
+        return Ok(ChatOverview {
+            version,
+            conversations: None,
+        });
+    }
+
+    let me = username.to_lowercase();
+    let mut conversations = Vec::new();
+
+    if is_buero_role(&role) {
+        let keys: Vec<String> = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT DISTINCT conversation FROM chat_messages
+                     WHERE conversation IS NOT NULL ORDER BY conversation",
+                )
+                .map_err(|e| e.to_string())?;
+            let v: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            v
+        };
+        for k in &keys {
+            conversations.push(conv_summary(&db, k, &me).map_err(|e| e.to_string())?);
+        }
+        let legacy_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE conversation IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if legacy_count > 0 {
+            conversations.push(conv_summary(&db, GENERAL, &me).map_err(|e| e.to_string())?);
+        }
+    } else {
+        // Lager (and view-only callers): only their own thread with the Büro.
+        conversations.push(conv_summary(&db, &me, &me).map_err(|e| e.to_string())?);
+    }
+
+    Ok(ChatOverview {
+        version,
+        conversations: Some(conversations),
+    })
+}
+
+/// Returns the full message list for one thread (oldest first).
+/// A Lager worker may only read their own conversation; Büro/Admin may read any.
+#[command]
+fn get_chat_thread(
+    state: State<DbState>,
+    username: String,
+    role: String,
+    conversation: String,
 ) -> Result<Vec<ChatMessage>, String> {
+    let me = username.to_lowercase();
+    let conv = conversation.to_lowercase();
+    let is_buero = is_buero_role(&role);
+
+    if !is_buero && (conv == GENERAL || conv != me) {
+        return Err("Forbidden".to_string());
+    }
+
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    let is_legacy = conv == GENERAL;
+
+    let map_row = |row: &rusqlite::Row| -> Result<ChatMessage, rusqlite::Error> {
+        Ok(ChatMessage {
+            id: row.get(0)?,
+            user: row.get(1)?,
+            text: row.get(2)?,
+            timestamp: row.get(3)?,
+            conversation: row.get(4)?,
+            sender_role: row.get(5)?,
+        })
+    };
+
+    let messages: Vec<ChatMessage> = if is_legacy {
+        let mut stmt = db
+            .prepare(
+                "SELECT id, user, text, timestamp, conversation, sender_role
+                 FROM chat_messages WHERE conversation IS NULL
+                 ORDER BY timestamp ASC LIMIT 200",
+            )
+            .map_err(|e| e.to_string())?;
+        let v: Vec<ChatMessage> = stmt
+            .query_map([], map_row)
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    } else {
+        let mut stmt = db
+            .prepare(
+                "SELECT id, user, text, timestamp, conversation, sender_role
+                 FROM chat_messages WHERE conversation = ?1
+                 ORDER BY timestamp ASC LIMIT 200",
+            )
+            .map_err(|e| e.to_string())?;
+        let v: Vec<ChatMessage> = stmt
+            .query_map(params![conv], map_row)
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+
+    Ok(messages)
+}
+
+#[command]
+fn send_chat_message(
+    state: State<DbState>,
+    sender: String,
+    role: String,
+    conversation: String,
+    text: String,
+) -> Result<(), String> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return Err("Message cannot be empty".to_string());
     }
 
+    let is_buero = is_buero_role(&role);
+    // Büro picks the target Lager worker's thread; Lager always writes to their own.
+    let conv = if is_buero {
+        conversation.trim().to_lowercase()
+    } else {
+        sender.to_lowercase()
+    };
+    if conv.is_empty() || conv == GENERAL {
+        return Err("Invalid conversation".to_string());
+    }
+    let sender_role = if is_buero { "buero" } else { "lager" };
+
     let db = state.0.lock().map_err(|e| e.to_string())?;
     let now = Local::now();
-    // Combine user prefix + nanoseconds to avoid ID collisions when multiple users send at once
-    let user_prefix: String = user.chars().take(6).collect();
+    let user_prefix: String = sender.chars().take(6).collect();
     let ns = now
         .timestamp_nanos_opt()
         .unwrap_or(now.timestamp_millis() * 1_000_000);
@@ -524,23 +786,44 @@ fn send_message(
     let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
 
     db.execute(
-        "INSERT INTO chat_messages (id, user, text, timestamp) VALUES (?1,?2,?3,?4)",
-        params![id, user, trimmed, timestamp],
+        "INSERT INTO chat_messages (id, user, text, timestamp, conversation, sender_role)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![id, sender, trimmed, timestamp, conv, sender_role],
     )
     .map_err(|e| e.to_string())?;
 
-    // Trim to MAX_CHAT_MESSAGES
+    // Trim this thread to the most recent MAX_CHAT_MESSAGES.
     db.execute(
-        "DELETE FROM chat_messages WHERE id NOT IN (
-             SELECT id FROM chat_messages ORDER BY timestamp DESC LIMIT ?1
+        "DELETE FROM chat_messages WHERE conversation = ?1 AND id NOT IN (
+             SELECT id FROM chat_messages WHERE conversation = ?1
+             ORDER BY timestamp DESC LIMIT ?2
          )",
-        params![MAX_CHAT_MESSAGES],
+        params![conv, MAX_CHAT_MESSAGES],
     )
     .map_err(|e| e.to_string())?;
 
-    bump_version(&db).map_err(|e| e.to_string())?;
+    bump_chat_version(&db).map_err(|e| e.to_string())?;
+    Ok(())
+}
 
-    load_recent_messages(&db).map_err(|e| e.to_string())
+#[command]
+fn mark_chat_read(
+    state: State<DbState>,
+    username: String,
+    conversation: String,
+) -> Result<(), String> {
+    let me = username.to_lowercase();
+    let conv = conversation.to_lowercase();
+    let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT INTO chat_reads (username, conversation, last_read) VALUES (?1,?2,?3)
+         ON CONFLICT(username, conversation) DO UPDATE SET last_read = excluded.last_read",
+        params![me, conv, now],
+    )
+    .map_err(|e| e.to_string())?;
+    bump_chat_version(&db).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[command]
@@ -682,8 +965,10 @@ pub fn run() {
             get_ramps,
             get_state,
             update_ramp,
-            get_messages,
-            send_message,
+            get_chat_overview,
+            get_chat_thread,
+            send_chat_message,
+            mark_chat_read,
             get_daily_log,
             get_events_for_period,
             get_user_role,
