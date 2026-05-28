@@ -806,6 +806,26 @@ fn send_chat_message(
     Ok(())
 }
 
+/// Deletes a single chat message. Büro/Admin only.
+#[command]
+fn delete_chat_message(
+    state: State<DbState>,
+    role: String,
+    message_id: String,
+) -> Result<(), String> {
+    if !is_buero_role(&role) {
+        return Err("Forbidden".to_string());
+    }
+    let db = state.0.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "DELETE FROM chat_messages WHERE id = ?1",
+        params![message_id],
+    )
+    .map_err(|e| e.to_string())?;
+    bump_chat_version(&db).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[command]
 fn mark_chat_read(
     state: State<DbState>,
@@ -968,6 +988,7 @@ pub fn run() {
             get_chat_overview,
             get_chat_thread,
             send_chat_message,
+            delete_chat_message,
             mark_chat_read,
             get_daily_log,
             get_events_for_period,

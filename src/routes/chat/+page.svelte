@@ -50,6 +50,7 @@
 
     let lagerUsers = $state<string[]>([]);
     let showPicker = $state(false);
+    let pendingDelete = $state<ChatMessage | null>(null);
 
     let lastChatVersion: number | null = null;
     let pollTimeout: number;
@@ -139,6 +140,22 @@
             chatInput = text;
         } finally {
             isSending = false;
+        }
+    }
+
+    async function deleteMessage() {
+        const msg = pendingDelete;
+        if (!msg || !isBuero) return;
+        pendingDelete = null;
+        try {
+            await invoke("delete_chat_message", {
+                role: userRole,
+                messageId: msg.id,
+            });
+            lastChatVersion = null; // force resync
+            if (selectedConv) await loadThread(selectedConv, false);
+        } catch (e) {
+            console.error("Failed to delete message:", e);
         }
     }
 
@@ -453,7 +470,7 @@
                     {/if}
 
                     <div
-                        class="flex gap-2.5 {isOwn
+                        class="group flex items-center gap-2.5 {isOwn
                             ? 'flex-row-reverse'
                             : 'flex-row'} {isFirst ? 'mt-1' : 'mt-[-6px]'}"
                     >
@@ -512,6 +529,29 @@
                                 </div>
                             {/if}
                         </div>
+                        {#if isBuero}
+                            <button
+                                onclick={() => (pendingDelete = msg)}
+                                class="w-7 h-7 rounded-full grid place-items-center shrink-0 cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
+                                style="color: var(--tr-text-faint);"
+                                aria-label="Nachricht löschen"
+                                title="Nachricht löschen"
+                            >
+                                <svg
+                                    width="14"
+                                    height="14"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    ><path
+                                        d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"
+                                    /></svg
+                                >
+                            </button>
+                        {/if}
                     </div>
                 {/each}
             </div>
@@ -557,5 +597,58 @@
                 </button>
             </form>
         </section>
+    {/if}
+
+    {#if pendingDelete}
+        <div
+            class="fixed inset-0 z-50 flex items-center justify-center"
+            style="background: rgba(0,0,0,0.5);"
+            onclick={(e) => {
+                if (e.target === e.currentTarget) pendingDelete = null;
+            }}
+            role="presentation"
+        >
+            <div
+                class="rounded-[12px] p-5 flex flex-col gap-4"
+                style="width: 340px; background: var(--tr-surface); border: 1px solid var(--tr-line);"
+            >
+                <div class="flex flex-col gap-1.5">
+                    <div
+                        class="text-[14px] font-semibold"
+                        style="color: var(--tr-text);"
+                    >
+                        Nachricht löschen?
+                    </div>
+                    <div
+                        class="text-[12px]"
+                        style="color: var(--tr-text-dim);"
+                    >
+                        Diese Nachricht wird endgültig für alle entfernt.
+                    </div>
+                </div>
+                <div
+                    class="text-[12.5px] px-3 py-2 rounded-[8px] break-words"
+                    style="background: var(--tr-surface2); border: 1px solid var(--tr-line); color: var(--tr-text-dim);"
+                >
+                    {pendingDelete.text}
+                </div>
+                <div class="flex gap-2 justify-end">
+                    <button
+                        onclick={() => (pendingDelete = null)}
+                        class="h-8 px-3 rounded-[7px] text-[12px] font-medium cursor-pointer"
+                        style="border: 1px solid var(--tr-line); background: var(--tr-surface2); color: var(--tr-text-dim);"
+                    >
+                        Abbrechen
+                    </button>
+                    <button
+                        onclick={deleteMessage}
+                        class="h-8 px-3 rounded-[7px] text-[12px] font-medium cursor-pointer"
+                        style="border: none; background: var(--tr-red); color: #fff;"
+                    >
+                        Löschen
+                    </button>
+                </div>
+            </div>
+        </div>
     {/if}
 </div>
