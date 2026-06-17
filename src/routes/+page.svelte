@@ -31,6 +31,7 @@
 
     let ramps = $state<Ramp[]>([]);
     let currentUser = $state("Unknown User");
+    let isEasterEggUser = $derived(currentUser.toLowerCase() === "karina.laib");
     let syncTimeout: number;
     let isUpdating = $state(false);
     let isConnected = $state(true);
@@ -276,6 +277,14 @@
                 glow: "var(--tr-green-glow)",
                 label: "Frei",
             };
+        if (status === "pending" && isEasterEggUser)
+            return {
+                fg: "var(--tr-magenta)",
+                bg: "var(--tr-magenta-bg)",
+                line: "var(--tr-magenta-line)",
+                glow: "var(--tr-magenta-glow)",
+                label: "Wartend",
+            };
         if (status === "pending")
             return {
                 fg: "var(--tr-warning)",
@@ -284,6 +293,7 @@
                 glow: "var(--tr-warning-glow)",
                 label: "Wartend",
             };
+
         return {
             fg: "var(--tr-red)",
             bg: "var(--tr-red-bg)",
@@ -1078,7 +1088,8 @@
                           minute: "2-digit",
                       })
                     : null}
-                {@const canEdit = canModify && isConnected && !isUpdating && !locked}
+                {@const canEdit =
+                    canModify && isConnected && !isUpdating && !locked}
                 {@const isEditKfz =
                     editingField?.rampId === ramp.id &&
                     editingField?.field === "kennzeichen"}
@@ -1503,7 +1514,9 @@
                         <div class="flex items-baseline gap-1.5">
                             <span
                                 class="font-mono text-[22px] font-semibold leading-none tabular-nums"
-                                style="color: var(--tr-warning);"
+                                style="color: {isEasterEggUser
+                                    ? 'var(--tr-magenta)'
+                                    : 'var(--tr-warning)'};"
                                 >{String(counts.pending).padStart(2, "0")}</span
                             >
                             <span

@@ -167,6 +167,10 @@
 	--tr-warning-bg: #FBF3E0;
 	--tr-warning-line: rgba(198,138,23,0.33);
 	--tr-warning-glow: rgba(198,138,23,0.40);
+	--tr-magenta: #C81E7C;
+	--tr-magenta-bg: #FBE6F2;
+	--tr-magenta-line: rgba(200,30,124,0.33);
+	--tr-magenta-glow: rgba(200,30,124,0.40);
 	--tr-bg: #F1F2F4;
 	--tr-surface: #FFFFFF;
 	--tr-surface2: #F8F9FA;
@@ -182,6 +186,8 @@
 	--tr-green-bg: #1B2C18;
 	--tr-warning: #E0A93B;
 	--tr-warning-bg: #3A2C12;
+	--tr-magenta: #E84BA0;
+	--tr-magenta-bg: #3A1228;
 	--tr-bg: #141720;
 	--tr-surface: #1A1D23;
 	--tr-surface2: #222630;
